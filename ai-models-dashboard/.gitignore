@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Private AI backend credentials
+.streamlit/secrets.toml
+
+# Local AI binaries, model weights and logs
+.local-ai/

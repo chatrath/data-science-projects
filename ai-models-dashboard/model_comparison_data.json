@@ -1,0 +1,274 @@
+{
+  "checked": "2026-10-11",
+  "profiles": {
+    "GPT-6.1 Sol": {
+      "input": 2,
+      "output": 10,
+      "context": "1,050,000 tokens; maximum output 128,000.",
+      "modalities": "Text and image input; text output.",
+      "pricing_note": "Standard API. Above 272,000 input tokens: input \u00d72 and output \u00d71.5.",
+      "threshold": 272000,
+      "input_multiplier": 2,
+      "output_multiplier": 1.5,
+      "url": "https://developers.openai.com/api/docs/models/gpt-6.1-sol",
+      "documentation_urls": [
+        "https://developers.openai.com/api/docs/models/gpt-6.1-sol.md",
+        "https://openai.com/index/introducing-gpt-6-1-sol/"
+      ]
+    },
+    "GPT-6 Astra": {
+      "input": 10,
+      "output": 50,
+      "context": "1,050,000 tokens; maximum output 128,000.",
+      "pricing_note": "Standard API. Confirm long-context and processing-tier pricing before purchase.",
+      "url": "https://developers.openai.com/api/docs/models/gpt-6-astra",
+      "documentation_urls": [
+        "https://developers.openai.com/api/docs/models/gpt-6-astra.md",
+        "https://openai.com/index/gpt-6-astra/"
+      ]
+    },
+    "Claude Sonnet 5.5": {
+      "input": 2,
+      "output": 10,
+      "pricing_note": "Standard Claude API token rates.",
+      "url": "https://www.anthropic.com/claude-sonnet-5-5",
+      "documentation_urls": [
+        "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+        "https://www.anthropic.com/claude-sonnet-5-5"
+      ]
+    },
+    "Claude Opus 5.5": {
+      "input": 4,
+      "output": 20,
+      "pricing_note": "Standard Claude API token rates; Fast and regional processing have different rates.",
+      "url": "https://www.anthropic.com/claude-opus-5-5",
+      "documentation_urls": [
+        "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+        "https://www.anthropic.com/claude-opus-5-5"
+      ]
+    },
+    "Claude Haiku 5.5": {
+      "input": 0.1,
+      "output": 0.5,
+      "threshold": 100000,
+      "input_multiplier": 5,
+      "output_multiplier": 5,
+      "pricing_note": "Standard API. Above 100,000 input tokens: USD 0.50 input / USD 2.50 output per million.",
+      "url": "https://www.anthropic.com/claude-haiku-5-5",
+      "documentation_urls": [
+        "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+        "https://www.anthropic.com/claude-haiku-5-5"
+      ]
+    },
+    "Gemini 3.1 Pro preview": {
+      "input": 2,
+      "output": 12,
+      "threshold": 200000,
+      "input_multiplier": 2,
+      "output_multiplier": 1.5,
+      "pricing_note": "Standard paid Gemini API. Above 200,000 input tokens: USD 4 input / USD 18 output per million. Reasoning tokens are billed as output.",
+      "url": "https://ai.google.dev/gemini-api/docs/pricing",
+      "documentation_urls": [
+        "https://ai.google.dev/gemini-api/docs/models.md",
+        "https://cloud.google.com/blog/products/ai-machine-learning/gemini-3-1-pro-on-gemini-cli-gemini-enterprise-and-vertex-ai"
+      ]
+    },
+    "Qwen3.8-27B": {
+      "context": "262,144 native tokens; model card describes extension to 1 million using YaRN.",
+      "deployment": "27B dense model. Validate memory, quantization, serving support and throughput on your hardware.",
+      "url": "https://huggingface.co/Qwen/Qwen3.8-27B",
+      "documentation_urls": [
+        "https://huggingface.co/Qwen/Qwen3.8-27B/raw/main/README.md",
+        "https://github.com/QwenLM/Qwen3.8"
+      ]
+    },
+    "Mistral Small 4": {
+      "context": "256,000 tokens.",
+      "deployment": "119B total parameters / 6B active MoE. Active parameters alone do not determine memory requirements.",
+      "license": "Apache 2.0; review the model card and any bundled component terms.",
+      "url": "https://huggingface.co/mistralai/Mistral-Small-4-119B-2603",
+      "documentation_urls": [
+        "https://huggingface.co/mistralai/Mistral-Small-4-119B-2603/raw/main/README.md",
+        "https://mistral.ai/news/mistral-small-4/"
+      ]
+    },
+    "Gemma 4": {
+      "context": "Variant-dependent: up to 256K; smaller variants use 128K.",
+      "modalities": "Text/image input; audio support varies by variant. Text output.",
+      "license": "Apache 2.0; select and check the exact variant.",
+      "url": "https://huggingface.co/google/gemma-4-31B",
+      "documentation_urls": [
+        "https://huggingface.co/google/gemma-4-31B/raw/main/README.md",
+        "https://blog.google/innovation-and-ai/technology/developers-tools/gemma-4/"
+      ]
+    },
+    "Llama 3": {
+      "documentation_urls": [
+        "https://raw.githubusercontent.com/meta-llama/llama3/main/README.md",
+        "https://about.fb.com/news/2024/04/meta-ai-assistant-built-with-llama-3/"
+      ]
+    },
+    "Llama 4 Scout / Maverick": {
+      "documentation_urls": [
+        "https://raw.githubusercontent.com/meta-llama/llama-models/main/models/llama4/MODEL_CARD.md",
+        "https://about.fb.com/ltam/news/2025/04/la-coleccion-de-modelos-llama-4-el-inicio-de-una-nueva-era-de-innovacion-multimodal-nativa-para-inteligencia-artificial/"
+      ]
+    },
+    "Phi-4 reasoning": {
+      "documentation_urls": [
+        "https://huggingface.co/microsoft/Phi-4-reasoning/raw/main/README.md",
+        "https://www.microsoft.com/en-us/research/publication/phi-4-reasoning-technical-report/"
+      ]
+    },
+    "Qwen3.5": {
+      "documentation_urls": [
+        "https://huggingface.co/Qwen/Qwen3.5-397B-A17B/raw/main/README.md",
+        "https://github.com/QwenLM/Qwen3.5"
+      ]
+    },
+    "DeepSeek-V3": {
+      "documentation_urls": [
+        "https://huggingface.co/deepseek-ai/DeepSeek-V3/raw/main/README.md",
+        "https://api-docs.deepseek.com/updates/#date-2024-12-26"
+      ]
+    },
+    "DeepSeek-R1": {
+      "documentation_urls": [
+        "https://huggingface.co/deepseek-ai/DeepSeek-R1/raw/main/README.md",
+        "https://api-docs.deepseek.com/updates/#date-2025-01-20"
+      ]
+    },
+    "GPT-4": {
+      "documentation_urls": [
+        "https://developers.openai.com/api/docs/models/gpt-4.md",
+        "https://openai.com/index/gpt-4/"
+      ]
+    },
+    "GPT-4o": {
+      "documentation_urls": [
+        "https://developers.openai.com/api/docs/models/gpt-4o.md",
+        "https://openai.com/index/hello-gpt-4o/"
+      ]
+    },
+    "GPT-5": {
+      "documentation_urls": [
+        "https://developers.openai.com/api/docs/models/gpt-5.md",
+        "https://openai.com/index/introducing-gpt-5/"
+      ]
+    },
+    "GPT-5.4": {
+      "documentation_urls": [
+        "https://developers.openai.com/api/docs/models/gpt-5.4.md",
+        "https://openai.com/index/introducing-gpt-5-4/"
+      ]
+    },
+    "GPT-5.5": {
+      "documentation_urls": [
+        "https://developers.openai.com/api/docs/models/gpt-5.5.md",
+        "https://openai.com/index/introducing-gpt-5-5/"
+      ]
+    },
+    "ChatGPT": {
+      "documentation_urls": [
+        "https://developers.openai.com/api/docs/models/gpt-3.5-turbo.md",
+        "https://openai.com/index/chatgpt/"
+      ]
+    },
+    "Llama 2": {
+      "documentation_urls": [
+        "https://raw.githubusercontent.com/meta-llama/llama/main/README.md",
+        "https://about.fb.com/news/2023/07/llama-2/"
+      ]
+    },
+    "Mixtral 8x7B": {
+      "documentation_urls": [
+        "https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1/raw/main/README.md",
+        "https://mistral.ai/news/mixtral-of-experts/"
+      ]
+    },
+    "Claude 3 family": {
+      "documentation_urls": [
+        "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+        "https://www.anthropic.com/news/claude-3-family"
+      ]
+    },
+    "Phi-3 mini": {
+      "documentation_urls": [
+        "https://huggingface.co/microsoft/Phi-3-mini-4k-instruct/raw/main/README.md",
+        "https://news.microsoft.com/source/features/ai/the-phi-3-small-language-models-with-big-potential/"
+      ]
+    },
+    "Qwen2": {
+      "documentation_urls": [
+        "https://huggingface.co/Qwen/Qwen2-7B-Instruct/raw/main/README.md",
+        "https://qwenlm.github.io/blog/qwen2/"
+      ]
+    },
+    "Gemma 2": {
+      "documentation_urls": [
+        "https://raw.githubusercontent.com/google-deepmind/gemma/main/README.md",
+        "https://blog.google/innovation-and-ai/technology/developers-tools/google-gemma-2/"
+      ]
+    },
+    "Gemma 3": {
+      "documentation_urls": [
+        "https://raw.githubusercontent.com/google-deepmind/gemma/main/README.md",
+        "https://blog.google/innovation-and-ai/technology/developers-tools/gemma-3/"
+      ]
+    },
+    "Gemini 2.5 Pro experimental": {
+      "documentation_urls": [
+        "https://ai.google.dev/gemini-api/docs/models.md",
+        "https://ai.google.dev/gemini-api/docs/changelog#march-25-2025"
+      ]
+    },
+    "Qwen3": {
+      "documentation_urls": [
+        "https://huggingface.co/Qwen/Qwen3-32B/raw/main/README.md",
+        "https://qwenlm.github.io/blog/qwen3/"
+      ]
+    },
+    "Claude 4": {
+      "documentation_urls": [
+        "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+        "https://www.anthropic.com/news/claude-4"
+      ]
+    },
+    "gpt-oss 20B / 120B": {
+      "documentation_urls": [
+        "https://huggingface.co/openai/gpt-oss-120b/raw/main/README.md",
+        "https://openai.com/index/introducing-gpt-oss/"
+      ]
+    },
+    "Gemini 3 Pro preview": {
+      "documentation_urls": [
+        "https://ai.google.dev/gemini-api/docs/models.md",
+        "https://workspaceupdates.googleblog.com/2025/11/introducing-gemini-3-pro-for-gemini-app.html"
+      ]
+    },
+    "Mistral Large 3 / Ministral 3": {
+      "documentation_urls": [
+        "https://huggingface.co/mistralai/Mistral-Large-3-675B-Instruct-2512/raw/main/README.md",
+        "https://mistral.ai/news/mistral-3/"
+      ]
+    },
+    "DeepSeek-V4 preview": {
+      "documentation_urls": [
+        "https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/raw/main/README.md",
+        "https://api-docs.deepseek.com/updates/"
+      ]
+    },
+    "DeepSeek-V4.1-Flash": {
+      "documentation_urls": [
+        "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/raw/main/README.md",
+        "https://api-docs.deepseek.com/updates/"
+      ]
+    },
+    "GPT-6 in ChatGPT": {
+      "documentation_urls": [
+        "https://developers.openai.com/api/docs/models/gpt-6-astra.md",
+        "https://openai.com/index/gpt-6-for-everyone/"
+      ]
+    }
+  }
+}
