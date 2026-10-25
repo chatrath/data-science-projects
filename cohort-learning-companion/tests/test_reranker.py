@@ -102,3 +102,27 @@ class RerankerTests(unittest.TestCase):
             result=rerank_candidates('Question',self.hits()[:5],3)
         self.assertEqual([h['id'] for h in result],['0','2','1'])
         self.assertEqual([h['rerank_score'] for h in result],[5.,3.,4.])
+
+
+class StrictThresholdTests(unittest.TestCase):
+    def test_exact_floor_passes_and_weaker_scores_are_dropped(self):
+        hits=[{'id':str(i),'text':f'Evidence {i}','score':.01,'metadata':{'source':'guide.pdf'}} for i in range(5)]
+        model=Mock();model.predict.return_value=[-1.,.45,.49999,.5,.9]
+        with patch('src.retriever._RERANKER',model):
+            result=rerank_candidates('Q',hits,5)
+        self.assertEqual([hit['rerank_score'] for hit in result],[.9,.5])
+        model.predict.assert_called_once()
+
+    def test_callers_cannot_lower_floor_but_can_raise_it(self):
+        hits=[{'id':'one','text':'Evidence','score':.01}]
+        model=Mock();model.predict.return_value=[.49]
+        with patch('src.retriever._RERANKER',model):
+            self.assertEqual(rerank_candidates('Q',hits,3,min_score=0),[])
+            model.predict.return_value=[.7]
+            self.assertEqual(rerank_candidates('Q',hits,3,min_score=1),[])
+
+    def test_nonfinite_thresholds_fail_before_model(self):
+        with patch('src.retriever._RERANKER') as model:
+            for cutoff in [float('nan'),float('inf'),float('-inf')]:
+                with self.assertRaises(ValueError):rerank_candidates('Q',[],3,min_score=cutoff)
+            model.predict.assert_not_called()

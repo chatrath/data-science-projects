@@ -500,3 +500,71 @@ ranks 3 through N, then rank 2. This puts the strongest chunk first and the
 runner-up last. For three chunks the order is 1, 3, 2; zero, one or two chunks
 keep their existing order. Scores, metadata and selected membership are unchanged.
 Hybrid-only (`--no-rerank`) selection retains its original order.
+
+
+PDF preview rendering reliability
+--------------------------------
+PDF slide ingestion renders to `corpus/rendered/` by default before OCR.
+Rasterization retries at lower resolution and writes atomically. Per-page
+OCR/render errors are recorded and counted, allowing later pages to continue.
+Blank text is not embedded; the page image and `needs_ocr` status remain in the
+processed record. Failed page caches retry on the next ingestion. The standalone
+CLI stages JSONL output and supports `--no-ocr`.
+
+Caches require complete page numbering, correct source/page paths and decodable
+images. Retrieval normalizes document/raw JSON metadata, reranks before rendering,
+and repairs missing, corrupt or wrong-page previews for selected local PDF hits.
+Both slide decks and strongly matched handout pages can provide previews. The
+0.75 raw cosine threshold remains independent of cross-encoder scores; transcript
+hits and low-confidence visuals cannot force pictures. Existing response/prompt
+behavior is preserved, with no native text source cards.
+
+
+Local semantic response cache
+-----------------------------
+`src/cache.py` stores successful, non-refused RAG result objects (answers,
+citations and image metadata) in `.local-db/cache/semantic.sqlite3`. It uses
+SQLite plus the CPU model `sentence-transformers/all-MiniLM-L6-v2`, downloaded
+once to `.local-db/semantic-cache-model`. No inference API keys or Ollama calls
+are needed for cache matching. These local files are ignored by Git.
+
+Configuration in `.env` (read on every incoming message):
+
+```dotenv
+ENABLE_SEMANTIC_CACHE=true
+SEMANTIC_CACHE_THRESHOLD=0.95
+SEMANTIC_CACHE_TTL_SECONDS=86400
+SEMANTIC_CACHE_MAX_ENTRIES=256
+```
+
+Set `ENABLE_SEMANTIC_CACHE=false` to immediately bypass all cache/model/SQLite
+work for subsequent requests without restarting. Explicit `.env` values take
+precedence over process values for these cache settings. When disabled, the
+existing retrieval, reranking, streaming and preview behavior is unchanged.
+
+Exact repeats use an indexed SQLite lookup without query embedding. Other
+queries require cosine >= the configured threshold and matching numeric/
+negation/quoted-code signatures. Long queries use exact matching only. This
+is conservative approximate matching: some equivalent paraphrases can still
+miss the threshold. The first semantic-model initialization is slower; warm
+cache hits avoid retrieval and generation entirely. Refusals/errors are not
+stored. Cache problems fail open to the normal streaming pipeline. Writes
+run after the final answer is delivered; all SQLite/embedding work uses
+worker threads, preserving async token streaming.
+
+Cache namespaces invalidate on corpus files, processed snapshots, Python code,
+`.env` and provider/model configuration changes. TTL and a bounded entry count
+limit retained history. A change during generation prevents a stale write.
+Cached image paths are checked before reuse; missing/corrupt previews cause a
+miss so the normal rendering repair can run. Existing image relevance gates
+and native image rendering stay in place; no text cards are introduced.
+
+To clear cached answers without touching the corpus, models or vector table:
+
+```powershell
+python -m src.cache clear
+```
+
+After manually changing the PostgreSQL table outside the ingestion pipeline,
+clear the response cache: such external edits do not update local snapshots.
+The cache contains local course-derived responses; it should remain private.

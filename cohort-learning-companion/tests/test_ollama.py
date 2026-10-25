@@ -15,13 +15,13 @@ def settings(**overrides):
 class OllamaTests(unittest.TestCase):
     def test_defaults_and_native_langchain_factories_need_no_keys(self):
         config = settings()
-        self.assertEqual((config.chat_model, config.embedding_model, config.embedding_dimensions), ('llama3.1:8b', 'nomic-embed-text', 768))
+        self.assertEqual((config.chat_model, config.embedding_model, config.embedding_dimensions), ('qwen3:4b-instruct', 'nomic-embed-text', 768))
         self.assertEqual(config.api_key, '')
         with patch('src.provider.OpenAI') as hosted, patch('src.provider.ChatOllama') as chat, patch('src.provider.OllamaEmbeddings') as embed:
             create_provider_client(config)
             create_embedding_client(config)
             hosted.assert_not_called()
-            self.assertEqual(chat.call_args.kwargs['model'], 'llama3.1:8b')
+            self.assertEqual(chat.call_args.kwargs['model'], 'qwen3:4b-instruct')
             self.assertEqual(embed.call_args.kwargs['model'], 'nomic-embed-text')
             self.assertEqual(embed.call_args.kwargs['num_ctx'], 8192)
             self.assertNotIn('api_key', embed.call_args.kwargs)

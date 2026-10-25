@@ -4,14 +4,19 @@ from __future__ import annotations
 import html
 from contextlib import aclosing
 import logging
+import os
 import re
 
 import chainlit as cl
 import httpx
 from ollama import ResponseError
 import psycopg
+from dotenv import dotenv_values
+from pathlib import Path
 
+from src.cache import get_semantic_cache, successful as cacheable_result
 from src.chain import RAGChain
+from src.agent_graph import AgentRAGChain
 from src.retriever import database_error_message, resolve_render_path, high_confidence_visual
 
 logger = logging.getLogger(__name__)
@@ -24,9 +29,43 @@ def chat_data_layer():
     return None
 
 
+def format_answer_markdown(content: str) -> str:
+    """Space model-produced answer sections without rewriting prose or code.
+
+    Streaming stays verbatim so split Markdown tokens/fences are never buffered
+    or rewritten. The final update repairs block spacing outside fenced code.
+    """
+    output = []
+    fence = None
+    after_heading = False
+    for line in content.splitlines(keepends=True):
+        body = line.rstrip('\r\n')
+        marker = re.match(r'^ {0,3}(`{3,}|~{3,})(.*)$', body)
+        if fence is not None:
+            output.append(line)
+            if marker and marker[1][0] == fence[0] and len(marker[1]) >= fence[1] and not marker[2].strip():
+                fence = None
+            continue
+        if after_heading and body.strip():
+            output.append('\n')
+        after_heading = False
+        if marker:
+            fence = (marker[1][0], len(marker[1]))
+            output.append(line)
+            continue
+        heading = bool(re.match(r'^ {0,3}#{1,6}\s+\S', body) or
+                       re.fullmatch(r'\*\*[^*]+\*\*:?[ \t]*', body))
+        numbered = bool(re.match(r'^\d+[.)]\s+\S', body))
+        if (heading or numbered) and output and output[-1].strip():
+            output.append('\n')
+        output.append(line)
+        after_heading = heading
+    return ''.join(output)
+
+
 def format_chat_answer(result: dict) -> str:
     """Keep answer Markdown/code intact and add cited source labels below it."""
-    content = result['answer']
+    content = format_answer_markdown(result['answer'])
     if result.get('sources'):
         lines = []
         for source in result['sources']:
@@ -41,6 +80,16 @@ def slide_image_elements(result: dict) -> list[cl.Image]:
     """Display only high-confidence slide frames, once per path."""
     elements, seen = [], set()
     for image in result.get('slide_images', []):
+        # AgentState carries paths selected by relevance-filtered retrieval.
+        # Conventional RAG results carry image metadata and a raw cosine score.
+        if isinstance(image, str):
+            path = resolve_render_path({'render_path': image})
+            if path is not None and path not in seen:
+                seen.add(path)
+                elements.append(cl.Image(path=path, name=Path(path).name, display='inline', size='large'))
+            continue
+        if not isinstance(image, dict):
+            continue
         if not high_confidence_visual(image.get('dense_score')):
             continue
         # Recheck paths at display time: a file may have moved since retrieval.
@@ -49,13 +98,22 @@ def slide_image_elements(result: dict) -> list[cl.Image]:
             continue
         seen.add(path)
         elements.append(cl.Image(path=path, name=image['label'], display='inline', size='large'))
+    # Agent paths originate only from the graph's relevance-filtered retrieval.
+    for raw in result.get('agent_image_paths', []):
+        path = resolve_render_path({'render_path': raw})
+        if path is not None and path not in seen:
+            seen.add(path)
+            elements.append(cl.Image(path=path, name=Path(path).name, display='inline', size='large'))
     return elements
 
 
 async def get_chain() -> RAGChain:
+    enabled = str(dotenv_values(Path(__file__).parent / '.env').get(
+        'ENABLE_AGENT_GRAPH', os.getenv('ENABLE_AGENT_GRAPH', 'false'))).lower() in {'true', '1', 'yes'}
     chain = cl.user_session.get('rag_chain')
-    if chain is None:
-        chain = await cl.make_async(RAGChain)()
+    if chain is None or cl.user_session.get('agent_graph_enabled') != enabled:
+        chain = await cl.make_async(AgentRAGChain if enabled else RAGChain)()
+        cl.user_session.set('agent_graph_enabled', enabled)
         cl.user_session.set('rag_chain', chain)
     return chain
 
@@ -106,6 +164,9 @@ async def on_chat_start():
 async def on_message(msg: cl.Message):
     reply = None
     elements = []
+    cache = lookup = result = None
+    cache_hit = False
+    response_succeeded = False
     try:
         query = (msg.content or '').strip()
         if not query:
@@ -116,23 +177,43 @@ async def on_message(msg: cl.Message):
             return
         reply = cl.Message(content='', author='Learning Companion')
         await reply.send()
-        chain = await get_chain()
-        result = None
-        async with aclosing(chain.astream(query)) as stream:
-            async for event in stream:
-                if event['type'] == 'token':
-                    await reply.stream_token(event['text'])
-                elif event['type'] == 'final':
-                    result = event['result']
+        try:
+            cache = await cl.make_async(get_semantic_cache)()
+            if cache is not None:
+                lookup = await cache.lookup(query)
+                result = lookup.result
+        except Exception as exc:
+            logger.warning('Semantic cache lookup bypassed (%s)', type(exc).__name__)
+            cache = lookup = None
+        cache_hit = result is not None
+        if cache_hit:
+            logger.info('Semantic cache hit (cosine %.3f)', lookup.similarity or 1.0)
+        if not cache_hit:
+            chain = await get_chain()
+            async with aclosing(chain.astream(query)) as stream:
+                async for event in stream:
+                    if event['type'] == 'token':
+                        # Chainlit renders Markdown as tokens arrive. Preserve split
+                        # markup/code fences; normalize spacing only in the final update.
+                        await reply.stream_token(event['text'])
+                    elif event['type'] == 'final':
+                        result = event['result']
         if result is None:
             raise RuntimeError('Generation ended without a final result')
         # Normalize grouped citations and replace provisional text if the final
         # citation check refuses the answer. Attach sources/images only now.
         content = format_chat_answer(result)
         elements = slide_image_elements(result)
+        response_succeeded = True
         if elements:
             content += '\n\n**Retrieved slide previews**\n\nThese slides accompany the retrieved text. The answer above uses text evidence.'
     except Exception as exc:
         logger.warning('Chat request failed (%s)', type(exc).__name__)
         content = error_message(exc)
     await deliver(content, reply, elements)
+    # Write after final UI delivery, so cache embedding/disk I/O cannot delay tokens.
+    if cache is not None and lookup is not None and response_succeeded and cacheable_result(result) and not cache_hit:
+        try:
+            await cache.store(query, result, lookup)
+        except Exception as exc:
+            logger.warning('Semantic cache write bypassed (%s)', type(exc).__name__)

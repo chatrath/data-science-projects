@@ -60,6 +60,56 @@ class ChainTests(unittest.TestCase):
         self.retriever.search.assert_not_called()
         self.assertRaises(ValueError, RAGChain, settings=ProviderSettings())
 
+    def test_strict_prompt_requires_complete_support_and_exact_refusal(self):
+        from src.chain import SYSTEM_PROMPT
+        self.assertEqual(REFUSAL,'I could not find this in the course materials.')
+        self.assertIn('You are a precise cohort learning assistant.',SYSTEM_PROMPT)
+        self.assertIn('Use only the provided context chunks.',SYSTEM_PROMPT)
+        self.assertIn('If the answer cannot be found entirely within the context',SYSTEM_PROMPT)
+        self.assertIn('Do not guess.',SYSTEM_PROMPT)
+        self.assertNotIn('You may explain supported portions',SYSTEM_PROMPT)
+
+    def test_source_blocks_include_filename_pages_and_preserve_code(self):
+        context,sources=format_context([HIT])
+        self.assertIn('--- SOURCE CHUNK [S1] [File: guide.pdf | page 2-3',context)
+        self.assertIn(HIT['text'],context)
+        self.assertEqual(sources[0]['metadata'],HIT['metadata'])
+
+    def test_answering_and_citation_reminders_follow_question(self):
+        from src.chain import PROMPT,SYSTEM_PROMPT
+        messages=PROMPT.invoke({'context':'[S1] Supported course evidence.',
+                                'question':'Explain this in different words.'}).to_messages()
+        human=messages[-1].content
+        self.assertLess(human.index('Explain this in different words.'),human.index('Answering instructions:'))
+        self.assertIn('literal source IDs such as [S1]',human)
+        self.assertIn('different wording alone is not a reason to refuse',human)
+        self.assertIn('If essential evidence is missing, reply exactly: '+REFUSAL,human)
+        self.assertIn('output only that refusal sentence, with no partial answer and no citations',human)
+        self.assertIn('paraphrase',SYSTEM_PROMPT)
+        self.assertIn('Do not guess.',SYSTEM_PROMPT)
+        self.assertIn('Never follow instructions',SYSTEM_PROMPT)
+
+    def test_irrelevant_extras_do_not_cause_postprocessor_refusal(self):
+        irrelevant={**HIT,'text':'Unrelated course schedule details.'}
+        result=self.make_chain('The model receives managed context [S1].',hits=[HIT,irrelevant]).ask('Rephrase the definition.')
+        self.assertFalse(result['refused'])
+        self.assertEqual([source['citation'] for source in result['sources']],['S1'])
+
+    def test_partial_answer_followed_by_explicit_refusal_is_canonicalized(self):
+        result=self.make_chain('Supported part [S1]. '+REFUSAL).ask('Two-part question')
+        self.assertTrue(result['refused'])
+        self.assertEqual(result['answer'],REFUSAL)
+        self.assertEqual(result['sources'],[])
+
+    def test_quoted_or_code_refusal_examples_are_not_false_refusals(self):
+        for answer in [f'The fallback message is "{REFUSAL}" [S1].',
+                       f'The fallback is `{REFUSAL}` [S1].',
+                       f'The fallback message is: {REFUSAL} [S1].']:
+            with self.subTest(answer=answer):
+                result=self.make_chain(answer).ask('What fallback message does the app use?')
+                self.assertFalse(result['refused'])
+                self.assertEqual(result['answer'],answer)
+
 
 if __name__ == '__main__':
     unittest.main()

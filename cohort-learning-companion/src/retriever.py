@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+import logging
 import time
 from threading import Lock
 import os
@@ -57,6 +58,8 @@ ALTER TABLE companion_embedding_config ADD COLUMN IF NOT EXISTS base_url text NO
 
 
 SLIDE_IMAGE_MIN_COSINE = 0.75
+_SLIDE_RENDER_LOCK = Lock()
+logger = logging.getLogger(__name__)
 
 
 def high_confidence_visual(score: object) -> bool:
@@ -68,36 +71,241 @@ def high_confidence_visual(score: object) -> bool:
             and math.isfinite(score) and SLIDE_IMAGE_MIN_COSINE <= score <= 1.0)
 
 
-def relevant_slide_render_path(hit: dict) -> str | None:
-    metadata = hit.get('metadata', {})
-    if metadata.get('kind') != 'slide' or not high_confidence_visual(hit.get('dense_score')):
+def normalize_chunk(value) -> dict | None:
+
+    """Accept hit dictionaries, document-shaped records or serialized JSON.
+
+
+
+    Unusable payloads are skipped at retrieval boundaries. JSONL ingestion still
+
+    reports malformed records explicitly rather than silently losing input.
+
+    """
+
+    if isinstance(value, str):
+
+        try:
+
+            value = json.loads(value)
+
+        except (ValueError, TypeError):
+
+            return None
+
+    if not isinstance(value, dict):
+
         return None
-    return resolve_render_path(metadata)
+
+    nested = value.get('metadata', {})
+
+    if not isinstance(nested, dict):
+
+        return None
+
+    text = next((value[k] for k in ('page_content', 'text', 'content') if isinstance(value.get(k), str)), None)
+
+    if text is None:
+
+        return None
+
+    # Decode a serialized source record, not arbitrary JSON/code in course text.
+
+    if text.lstrip().startswith('{'):
+
+        try:
+
+            inner = json.loads(text)
+
+        except ValueError:
+
+            inner = None
+
+        if isinstance(inner, dict) and (inner.get('source') or isinstance(inner.get('metadata'), dict) and inner['metadata'].get('source')):
+
+            normalized = normalize_chunk(inner)
+
+            if normalized is not None:
+
+                text = normalized['text']
+
+                nested = {**normalized['metadata'], **nested}
+
+    metadata = {k: v for k, v in value.items() if k not in {
+
+        'text', 'page_content', 'content', 'metadata', 'score', 'dense_score',
+
+        'dense_rank', 'bm25_score', 'bm25_rank', 'rerank_score', 'rrf_score',
+
+        'source_boost', 'selection_reason', 'baseline_relevance_met', 'keyword_coverage'}}
+
+    metadata.update(nested)
+
+    for key in ('page_number', 'page_start', 'page_end'):
+
+        if isinstance(metadata.get(key), str) and metadata[key].isdigit():
+
+            metadata[key] = int(metadata[key])
+
+    if metadata.get('kind') in (None, '', 'material'):
+
+        source_parts = str(metadata.get('source', '')).replace('\\', '/').split('/')
+
+        if 'page_number' in metadata:
+
+            metadata['kind'] = 'slide'
+
+        elif 'page_start' in metadata and 'pdfs' in source_parts:
+
+            metadata['kind'] = 'handout'
+
+    if metadata.get('kind') == 'slide' and 'page_number' not in metadata and isinstance(metadata.get('page_start'), int):
+
+        metadata['page_number'] = metadata['page_start']
+
+    return {**value, 'text': text, 'page_content': text, 'metadata': metadata,
+
+            'score': value.get('score', 0.0)}
+
+
+def relevant_source_render_path(hit: dict) -> str | None:
+
+    hit = normalize_chunk(hit)
+
+    if hit is None:
+
+        return None
+
+    metadata = hit['metadata']
+
+    if metadata.get('kind') not in {'slide', 'handout'} or not high_confidence_visual(hit.get('dense_score')):
+
+        return None
+
+    existing = resolve_render_path(metadata)
+
+    source = metadata.get('source')
+
+    page_number = metadata.get('page_number') if metadata['kind'] == 'slide' else metadata.get('page_start')
+
+    if isinstance(page_number, bool) or not isinstance(page_number, int) or page_number < 1:
+
+        return None
+
+    if not isinstance(source, str):
+
+        return existing
+
+    try:
+
+        source_root = (ROOT / 'corpus' / ('slides' if metadata['kind'] == 'slide' else 'pdfs')).resolve()
+
+        source_path = Path(source.replace('\\', '/'))
+
+        candidates = [source_path] if source_path.is_absolute() else [ROOT / source_path, source_root / source_path]
+
+        parts = source.replace('\\', '/').split('/')
+
+        for index in range(len(parts) - 1):
+
+            if parts[index:index + 2] == ['corpus', source_root.name]:
+
+                candidates.append(source_root.joinpath(*parts[index + 2:]))
+
+        source_path = next((p.resolve() for p in candidates if p.resolve().is_relative_to(source_root) and p.suffix.lower() == '.pdf' and p.is_file()), None)
+
+    except (OSError, ValueError):
+
+        return None
+
+    if source_path is None:
+
+        return existing
+
+    with _SLIDE_RENDER_LOCK:
+
+        try:
+
+            from .ingestion import render_slide_page, render_path_for, valid_render
+
+            expected = render_path_for(source_path, page_number, ROOT / 'corpus' / 'rendered')
+
+            if expected.is_file() and valid_render(expected):
+
+                return str(expected.resolve())
+
+            return render_slide_page(source_path, page_number, ROOT / 'corpus' / 'rendered')
+
+        except Exception as exc:
+
+            logger.warning('PDF preview unavailable (%s)', type(exc).__name__)
+
+            return None
+
+
+def relevant_slide_render_path(hit: dict) -> str | None:
+
+    """Compatibility helper restricted to slide-deck records."""
+
+    hit = normalize_chunk(hit)
+
+    if hit is None or hit['metadata'].get('kind') != 'slide':
+
+        return None
+
+    return relevant_source_render_path(hit)
 
 
 def resolve_render_path(metadata: dict) -> str | None:
+
     """Resolve an existing slide preview only within this project's renders.
 
+
+
     Old absolute paths can be rebased after moving the project. Canonical path
+
     checks prevent serving unrelated files through imported JSONL metadata.
+
     """
+
     raw = metadata.get('render_path')
+
     if not isinstance(raw, str) or not raw.strip():
+
         return None
+
     root = (ROOT / 'corpus' / 'rendered').resolve()
+
     normalized = raw.replace('\\', '/')
+
     candidates = [Path(normalized)] if Path(normalized).is_absolute() else [ROOT / normalized, root / normalized]
+
     parts = normalized.split('/')
+
     for index in range(len(parts) - 1):
+
         if parts[index:index + 2] == ['corpus', 'rendered']:
+
             candidates.append(root.joinpath(*parts[index + 2:]))
+
     for candidate in candidates:
+
         try:
+
             candidate = candidate.resolve()
+
             if candidate.is_relative_to(root) and candidate.suffix.lower() in {'.png', '.jpg', '.jpeg', '.webp'} and candidate.is_file():
-                return str(candidate)
+
+                from .ingestion import valid_render
+
+                if valid_render(candidate):
+
+                    return str(candidate)
+
         except (OSError, ValueError):
+
             continue
+
     return None
 
 
@@ -116,42 +324,87 @@ class Chunk:
 
 
 def read_jsonl(paths: Iterable[Path]) -> tuple[list[Chunk], list[str], int]:
+
     chunks, datasets, skipped = [], [], 0
+
     for path in paths:
+
         path = Path(path).resolve()
+
         dataset = str(path)
+
         if dataset in datasets:
+
             raise ValueError(f'Duplicate input: {path}')
+
         datasets.append(dataset)
+
         seen = set()
+
         with path.open(encoding='utf-8-sig') as stream:
+
             for number, line in enumerate(stream, 1):
+
                 if not line.strip():
+
                     continue
+
                 try:
+
                     record = json.loads(line)
+
                 except json.JSONDecodeError as exc:
+
                     raise ValueError(f'{path.name}:{number}: invalid JSON') from exc
-                if not isinstance(record, dict) or not isinstance(record.get('text'), str):
+
+                normalized = normalize_chunk(record)
+
+                if normalized is None:
+
                     raise ValueError(f'{path.name}:{number}: expected an object with string text')
+
+                record = {**normalized['metadata'], 'text': normalized['text']}
+
+                if isinstance(normalized.get('id'), str):
+
+                    record['id'] = normalized['id']
+
                 if not isinstance(record.get('source'), str) or not record['source'].strip():
+
                     raise ValueError(f'{path.name}:{number}: missing source')
+
                 text = record['text']
+
                 if not text.strip():
+
                     skipped += 1
+
                     continue
+
                 # Line identity is stable across reruns; removed lines are pruned
+
                 # within this input dataset when its replacement is committed.
+
                 identity = str(record.get('id') or f"{record['source']}:{record.get('page_number', number)}")
+
                 chunk_id = hashlib.sha256(f'{dataset}\0{identity}'.encode()).hexdigest()
+
                 if chunk_id in seen:
+
                     raise ValueError(f'{path.name}:{number}: duplicate record identity')
+
                 seen.add(chunk_id)
+
                 metadata = {k: v for k, v in record.items() if k != 'text'}
+
                 metadata.setdefault('kind', 'slide' if 'page_number' in record else 'material')
+
                 metadata['jsonl_source'] = dataset
+
                 metadata['jsonl_line'] = number
+
                 chunks.append(Chunk(chunk_id, dataset, text, hashlib.sha256(text.encode()).hexdigest(), metadata))
+
     return chunks, datasets, skipped
 
 
@@ -266,17 +519,22 @@ def stratify_results(ranked: list[dict], lookup: dict, query: str, top_k: int, *
 
 
 RERANK_MODEL = 'cross-encoder/ms-marco-MiniLM-L6-v2'
+# Raw cross-encoder logit floor, not cosine similarity or probability.
+MIN_RERANK_SCORE = 0.5
 _RERANK_LOCK = Lock()
 _RERANKER = None
 
 
-def rerank_candidates(query: str, hits: list[dict], top_k: int, min_score: float = 0.0) -> list[dict]:
+def rerank_candidates(query: str, hits: list[dict], top_k: int, min_score: float = MIN_RERANK_SCORE) -> list[dict]:
     """Batch joint query/passage scoring; no source quotas after reranking.
 
     Scores are raw model logits, not cosine similarities or probabilities.
     The model is loaded lazily once per process and runs locally on CPU.
     Selected chunks put rank 1 first, rank 2 last, and ranks 3+ in between.
     """
+    if not math.isfinite(min_score):
+        raise ValueError('Minimum rerank score must be finite')
+    min_score = max(MIN_RERANK_SCORE, min_score)
     if not hits:
         return []
     global _RERANKER
@@ -427,7 +685,7 @@ class HybridRetriever:
                 'unique_embedding_inputs': len({c.content for c in changed}),
                 'embedding_batches': math.ceil(len({c.content for c in changed}) / self.settings.embedding_batch_size)}
 
-    def search(self, query: str, top_k: int = 3, candidates: int = 25, bm25_weight: float = 0.5, *, rerank: bool = True, rerank_pool: int = 15, min_rerank_score: float = 0.0, stratified: bool = True, transcript_boost: float = 1.1, min_cosine: float = 0.6, min_bm25: float = 2.0, min_keyword_coverage: float = 0.25) -> list[dict]:
+    def search(self, query: str, top_k: int = 3, candidates: int = 25, bm25_weight: float = 0.5, *, rerank: bool = True, rerank_pool: int = 15, min_rerank_score: float = MIN_RERANK_SCORE, stratified: bool = True, transcript_boost: float = 1.1, min_cosine: float = 0.6, min_bm25: float = 2.0, min_keyword_coverage: float = 0.25) -> list[dict]:
         if rerank_pool < 1 or not math.isfinite(min_rerank_score):
             raise ValueError('Require positive rerank pool and finite minimum rerank score')
         if not query.strip() or not tokenize(query):
@@ -473,9 +731,15 @@ class HybridRetriever:
         pool_size = max(top_k, rerank_pool) if rerank else top_k
         selected = stratify_results(ranked, lookup, query, pool_size, min_cosine=min_cosine, min_bm25=min_bm25, min_keyword_coverage=min_keyword_coverage) if stratified else ranked[:pool_size]
         hits = [{**hit, 'text': lookup[hit['id']]['content'], 'metadata': lookup[hit['id']]['metadata'],
-                 'render_path': relevant_slide_render_path({**hit, 'metadata': lookup[hit['id']]['metadata']})}
+                 'render_path': resolve_render_path(lookup[hit['id']]['metadata'])}
                 for hit in selected]
-        return rerank_candidates(query, hits, top_k, min_rerank_score) if rerank else hits
+        hits = [chunk for hit in hits if (chunk := normalize_chunk(hit)) is not None and chunk['text'].strip()]
+        hits = rerank_candidates(query, hits, top_k, min_rerank_score) if rerank else hits
+        for hit in hits:
+            hit['render_path'] = relevant_source_render_path(hit)
+            if hit['render_path']:
+                hit['metadata']['render_path'] = hit['render_path']
+        return hits
 
 
 def database_error_message(exc: psycopg.Error) -> str:
@@ -529,7 +793,7 @@ def main() -> None:
     search.add_argument('--top-k', type=int, default=3)
     search.add_argument('--no-rerank', action='store_true', help='Explicitly bypass local cross-encoder reranking')
     search.add_argument('--rerank-pool', type=int, default=15)
-    search.add_argument('--min-rerank-score', type=float, default=0.0, help='Minimum raw cross-encoder logit; not a probability')
+    search.add_argument('--min-rerank-score', type=float, default=MIN_RERANK_SCORE, help='Minimum raw cross-encoder logit (floor 0.5); not a probability')
     search.add_argument('--candidates', type=int, default=25)
     search.add_argument('--bm25-weight', type=float, default=0.5)
     search.add_argument('--transcript-boost', type=float, default=1.1, help='Relevant transcript RRF multiplier, 1 to 1.5; 1 disables')

@@ -63,6 +63,18 @@ class RetrievalTests(unittest.TestCase):
             self.assertNotEqual(chunks[0].content_hash, updated[0].content_hash)
             self.assertRaises(ValueError, read_jsonl, [path, path])
 
+    def test_document_jsonl_preserves_page_and_render_metadata_when_blanks_are_skipped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'documents.jsonl'
+            records=[{'page_content':'Slide evidence','metadata':{'source':'deck.pdf','page_number':'2','render_path':'corpus/rendered/deck/page_0002.png'}},
+                     {'page_content':'','metadata':{'source':'deck.pdf','page_number':3}}]
+            path.write_text('\n'.join(json.dumps(r) for r in records),encoding='utf-8')
+            chunks,_,skipped=read_jsonl([path])
+            self.assertEqual(skipped,1)
+            self.assertEqual(chunks[0].content,'Slide evidence')
+            self.assertEqual(chunks[0].metadata['page_number'],2)
+            self.assertEqual(chunks[0].metadata['render_path'],'corpus/rendered/deck/page_0002.png')
+
     def test_duplicate_identity_and_malformed_record_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'input.jsonl'

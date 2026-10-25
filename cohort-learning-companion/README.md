@@ -12,7 +12,7 @@ Use Python 3.13 for the Chainlit UI. With uv installed, run in PowerShell:
 uv venv --python 3.13 .venv
 uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 Copy-Item .env.example .env
-ollama pull llama3.1:8b
+ollama pull qwen3:4b-instruct
 ollama pull nomic-embed-text
 ```
 
@@ -54,3 +54,80 @@ Only application code, tests, configuration templates and documentation are
 intended for GitHub. `corpus/` (including rendered slides, JSONL exports and
 parse caches), `.env`, `.files/`, `.local-db/`, virtual environments and logs
 are excluded. Never add these ignored directories with `git add --force`.
+
+
+### Optional corrective RAG agent
+
+Set `ENABLE_AGENT_GRAPH=true` in `.env` and restart Chainlit to use the local
+LangGraph agent. The default (`false`) keeps the existing RAG pipeline. The
+agent decomposes the question, retrieves and reranks evidence, and proceeds
+straight to generation when any nonblank reranked chunks remain. Grading is a
+local evidence check with no extra Ollama call. Empty retrieval retries once;
+no evidence after two attempts returns the standard refusal. Planning and
+retrieval run off the UI event loop; only
+final-answer tokens are streamed. Relevant validated PDF previews remain image
+elements, without source text cards. The text-only model does not inspect images.
+
+The compiled graph also supports direct asynchronous invocation:
+
+```python
+from src.agent_graph import graph
+
+state = await graph.ainvoke({"question": "What is context engineering?", "loop_step": 0})
+answer = state["generation"]
+image_paths = state["slide_images"]
+```
+
+
+Retrieval enforces a minimum cross-encoder raw logit of **0.5** before selecting
+context chunks (this score is not cosine similarity or a probability). A higher
+`--min-rerank-score` may tighten CLI searches; lower values cannot weaken the
+floor. `--no-rerank` remains an explicit diagnostic bypass. No second LLM grader
+is used. Context blocks retain source filenames, page metadata and citation IDs.
+If the context cannot support the complete answer, generation responds:
+`I could not find this in the course materials.`
+
+
+The local generation model defaults to `qwen3:4b-instruct`. Set
+`OLLAMA_CHAT_MODEL` in `.env` to override it for both agent query planning and
+answer generation. Changing the chat model does not require re-embedding the
+corpus; embeddings continue to use `nomic-embed-text`.
+
+
+### Incremental PDF updates
+
+Drop PDFs into `corpus/pdfs/` (handouts) or `corpus/slides/` (decks), then run:
+
+```powershell
+python update_corpus.py
+```
+
+The scan also accepts PDFs directly under `corpus/` or other raw subfolders.
+Generated renders and hidden cache folders are excluded. File hashes identify
+new/modified PDFs; unchanged indexed files are skipped. Existing PDFs indexed
+before this updater are registered without re-embedding on its first scan.
+
+Handouts retain logical sections and page metadata. Text is split into windows
+of 800 reference-tokenizer tokens with 150-token overlap by default; slide
+windows never cross page boundaries. Section tails can be shorter. A conservative
+UTF-8 byte limit also protects embedding inputs. To customize the scan:
+
+```powershell
+python update_corpus.py --corpus corpus --chunk-tokens 800 --overlap-tokens 150
+```
+
+Embeddings use local `nomic-embed-text` with 768 dimensions and F16 model weights.
+New vector values are rounded to F16 precision; the existing PostgreSQL
+`vector(768)` column stores those values as float32, avoiding a schema migration.
+Embedding calls remain batched. No chat model or API key is needed.
+
+The updater merges complete JSONL snapshots to preserve earlier handouts,
+slides, and transcripts. It refuses incomplete snapshots rather than deleting
+older indexed data. Checkpoints are written only after successful DB ingestion.
+BM25 uses the same unified table and is rebuilt on every search, so active
+Chainlit sessions see new vocabulary without restarting the app. The script
+also constructs a fresh BM25 index after ingestion to validate the refresh.
+All processed snapshots, hashes, renders and manifests stay under ignored
+`corpus/` paths. Rerun the scan whenever you add PDFs; `--reprocess` reparses all
+PDFs while reusing unchanged embeddings. Files removed from disk are retained
+in the index by this incremental updater.

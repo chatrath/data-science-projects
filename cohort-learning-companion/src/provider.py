@@ -64,7 +64,7 @@ class ProviderSettings:
             return number
         return cls(provider, '' if local else value(f'{prefix}_API_KEY'), base_url,
                    value(f'{prefix}_EMBEDDING_MODEL', 'nomic-embed-text' if local else 'Qwen/Qwen3-Embedding-8B' if nebius else 'text-embedding-3-small'),
-                   dimensions, value(f'{prefix}_CHAT_MODEL', 'llama3.1:8b' if local else ''),
+                   dimensions, value(f'{prefix}_CHAT_MODEL', 'qwen3:4b-instruct' if local else ''),
                    embedding_batch_size=integer('EMBEDDING_BATCH_SIZE',32,1,32),
                    rag_top_k=integer('RAG_TOP_K',3,1,25),
                    rag_context_bytes=integer('RAG_CONTEXT_BYTES',5000,256,24000),

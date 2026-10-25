@@ -1,0 +1,4 @@
+/* Keep the chat header free of the optional ReadMe control. */
+#readme-button {
+  display: none !important;
+}
