@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 LOCAL = ROOT / '.local-db'
 BIN = LOCAL / 'runtime' / 'Library' / 'bin'
 DATA = LOCAL / 'data'
+BOOTSTRAP = LOCAL / 'bootstrap.env'
 
 
 def run(*args, check=True):
@@ -33,6 +34,51 @@ def run(*args, check=True):
     return result
 
 
+def role_url(admin_url: str, role: str, password: str) -> str:
+    target = urlsplit(admin_url)
+    return target._replace(netloc=f'{quote(role, safe="")}:{quote(password, safe="")}@{target.hostname}:{target.port or 5432}').geturl()
+
+
+def configure_roles(bootstrap_url: str):
+    """Idempotently separate bootstrap, ingestion ownership, and chat SELECT.
+
+    Bootstrap stays outside the application .env. Only the two corpus tables
+    change ownership; existing rows, embeddings and model configuration survive.
+    """
+    config = dotenv_values(ROOT / '.env')
+    credentials = {}
+    for role, key in [('cohort_runtime', 'DATABASE_URL'), ('cohort_ingest', 'DATABASE_INGEST_URL')]:
+        saved = urlsplit(config.get(key) or '')
+        target = urlsplit(bootstrap_url)
+        reusable = (saved.username == role and saved.hostname == target.hostname
+                    and saved.port == target.port and saved.path == target.path and saved.password)
+        # Current generated secrets are URL-safe; decode for imported URLs too.
+        from urllib.parse import unquote
+        password = unquote(saved.password) if reusable else secrets.token_urlsafe(32)
+        credentials[role] = (key, password, role_url(bootstrap_url, role, password))
+    with psycopg.connect(bootstrap_url) as conn:
+        for role, (_, password, _) in credentials.items():
+            exists = conn.execute('SELECT 1 FROM pg_roles WHERE rolname=%s', (role,)).fetchone()
+            verb = 'ALTER' if exists else 'CREATE'
+            conn.execute(sql.SQL(verb + ' ROLE {} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT PASSWORD {}').format(sql.Identifier(role), sql.Literal(password)))
+        database = conn.execute('SELECT current_database()').fetchone()[0]
+        for role in credentials:
+            conn.execute(sql.SQL('GRANT CONNECT ON DATABASE {} TO {}').format(sql.Identifier(database), sql.Identifier(role)))
+        conn.execute('REVOKE CREATE ON SCHEMA public FROM PUBLIC')
+        conn.execute('GRANT USAGE ON SCHEMA public TO cohort_runtime, cohort_ingest')
+        conn.execute('GRANT CREATE ON SCHEMA public TO cohort_ingest')
+        for table in ['companion_chunks', 'companion_embedding_config']:
+            if conn.execute('SELECT to_regclass(%s)', ('public.' + table,)).fetchone()[0]:
+                identifier = sql.Identifier('public', table)
+                conn.execute(sql.SQL('ALTER TABLE {} OWNER TO cohort_ingest').format(identifier))
+                conn.execute(sql.SQL('REVOKE ALL ON TABLE {} FROM PUBLIC, cohort_runtime').format(identifier))
+                conn.execute(sql.SQL('GRANT SELECT ON TABLE {} TO cohort_runtime').format(identifier))
+        conn.execute('ALTER DEFAULT PRIVILEGES FOR ROLE cohort_ingest IN SCHEMA public GRANT SELECT ON TABLES TO cohort_runtime')
+        conn.execute('ALTER ROLE cohort_runtime SET default_transaction_read_only = on')
+    for key, _, url in credentials.values():
+        set_key(str(ROOT / '.env'), key, url)
+
+
 def start():
     if not (BIN / 'pg_ctl.exe').exists():
         raise RuntimeError('Project-local PostgreSQL runtime is missing; see RETRIEVAL.md')
@@ -40,7 +86,8 @@ def start():
     config = dotenv_values(ROOT / '.env')
     initialized = (DATA / 'PG_VERSION').exists()
     if initialized:
-        url = config.get('DATABASE_URL', '')
+        url = (dotenv_values(BOOTSTRAP).get('DATABASE_BOOTSTRAP_URL')
+               or config.get('DATABASE_BOOTSTRAP_URL') or config.get('DATABASE_URL', ''))
         target = urlsplit(url)
         if target.hostname != '127.0.0.1' or not target.username or not target.path.strip('/'):
             raise RuntimeError('Existing local cluster requires its saved DATABASE_URL in .env; credentials were not changed')
@@ -64,10 +111,12 @@ def start():
             if password_file:
                 password_file.unlink(missing_ok=True)
         url = f'postgresql://{user}:{quote(password, safe="")}@127.0.0.1:{port}/{database}'
-        set_key(str(ROOT / '.env'), 'DATABASE_URL', url)
+        set_key(str(BOOTSTRAP), 'DATABASE_BOOTSTRAP_URL', url)
     if run(BIN / 'pg_ctl.exe', '-D', DATA, 'status', check=False).returncode != 0:
         run(BIN / 'pg_ctl.exe', '-D', DATA, '-l', LOCAL / 'postgres.log',
             '-o', f'-h 127.0.0.1 -p {port}', '-w', '-t', '30', 'start')
+    # Preserve the administrator URL before replacing application credentials.
+    set_key(str(BOOTSTRAP), 'DATABASE_BOOTSTRAP_URL', url)
     admin = urlsplit(url)
     admin_url = admin._replace(path='/postgres').geturl()
     with psycopg.connect(admin_url, autocommit=True, connect_timeout=5) as conn:
@@ -76,6 +125,7 @@ def start():
     with psycopg.connect(url, autocommit=True, connect_timeout=5) as conn:
         conn.execute('CREATE EXTENSION IF NOT EXISTS vector')
         version = conn.execute("SELECT extversion FROM pg_extension WHERE extname='vector'").fetchone()[0]
+    configure_roles(url)
     print(f'PostgreSQL ready at 127.0.0.1:{port}/{database}; pgvector {version}. DATABASE_URL saved in .env.')
 
 

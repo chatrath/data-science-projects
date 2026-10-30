@@ -32,6 +32,12 @@ class ProviderSettings:
     ollama_num_thread: int | None = None
     ollama_keep_alive: int = 600
 
+    # Multi-part requests can retain two precise chunks per part, bounded overall.
+    rag_multi_max_chunks: int = 6
+    rag_multi_chunks_per_query: int = 2
+    rag_multi_context_bytes: int = 10000
+    rag_multi_num_predict: int = 384
+
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> 'ProviderSettings':
         if env is None:
@@ -71,7 +77,11 @@ class ProviderSettings:
                    ollama_num_ctx=integer('OLLAMA_NUM_CTX',8192,2048,32768),
                    ollama_num_predict=integer('OLLAMA_NUM_PREDICT',256,1,1024),
                    ollama_num_thread=integer('OLLAMA_NUM_THREAD',1,1,256) if value('OLLAMA_NUM_THREAD') else None,
-                   ollama_keep_alive=integer('OLLAMA_KEEP_ALIVE',600,0,86400))
+                   ollama_keep_alive=integer('OLLAMA_KEEP_ALIVE',600,0,86400),
+                   rag_multi_max_chunks=integer('RAG_MULTI_MAX_CHUNKS',6,1,12),
+                   rag_multi_chunks_per_query=integer('RAG_MULTI_CHUNKS_PER_QUERY',2,1,3),
+                   rag_multi_context_bytes=integer('RAG_MULTI_CONTEXT_BYTES',10000,256,24000),
+                   rag_multi_num_predict=integer('RAG_MULTI_NUM_PREDICT',384,1,1024))
 
 
 def create_provider_client(settings: ProviderSettings | None = None) -> OpenAI | ChatOllama:

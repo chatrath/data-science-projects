@@ -10,6 +10,8 @@ is embedded; visual layouts and citation metadata remain attached to results.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+from contextvars import ContextVar
 from collections import Counter, defaultdict, OrderedDict
 from dataclasses import dataclass
 import hashlib
@@ -36,6 +38,7 @@ from psycopg.types.json import Jsonb
 import tiktoken
 
 ROOT = Path(__file__).resolve().parents[1]
+_INGEST_CONNECTION = ContextVar("ingest_connection", default=False)
 # Fixed names keep SQL identifiers separate from user input.
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS companion_embedding_config (
@@ -574,6 +577,7 @@ class HybridRetriever:
         self.database_url = database_url or os.getenv('DATABASE_URL')
         if not self.database_url:
             raise ValueError('Set DATABASE_URL in the project .env')
+        self.ingestion_database_url = database_url or os.getenv('DATABASE_INGEST_URL') or self.database_url
         self.settings = settings or ProviderSettings.from_env()
         self.client = client if client is not None else create_embedding_client(self.settings)
         self.encoding = tiktoken.get_encoding('cl100k_base') if self.settings.provider == 'openai' else None
@@ -581,7 +585,19 @@ class HybridRetriever:
         self._query_cache_lock = Lock()
 
     def _connect(self):
-        return psycopg.connect(self.database_url, autocommit=True, row_factory=dict_row, connect_timeout=10)
+        url = self.ingestion_database_url if _INGEST_CONNECTION.get() else self.database_url
+        return psycopg.connect(url, autocommit=True, row_factory=dict_row, connect_timeout=10)
+
+    @contextmanager
+    def _connect_ingest(self):
+        # Context-local selection keeps concurrent searches read-only and retains
+        # the existing _connect() interface used by integrations/test doubles.
+        token = _INGEST_CONNECTION.set(True)
+        try:
+            with self._connect() as conn:
+                yield conn
+        finally:
+            _INGEST_CONNECTION.reset(token)
 
     def _check_config(self, conn):
         config = conn.execute('SELECT provider, base_url, model, dimensions FROM companion_embedding_config WHERE singleton').fetchone()
@@ -656,7 +672,7 @@ class HybridRetriever:
         if not datasets:
             raise ValueError('No input files supplied')
         self._validate_texts([chunk.content for chunk in chunks])
-        with self._connect() as conn:
+        with self._connect_ingest() as conn:
             # Extension installation may require DBA privileges on a managed DB.
             conn.execute('CREATE EXTENSION IF NOT EXISTS vector')
             register_vector(conn)

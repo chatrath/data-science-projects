@@ -22,3 +22,5 @@ class AgentState(TypedDict):
     # Preserve retrieval provenance while keeping documents as text for grading.
     retrieved_chunks: NotRequired[List[dict]]
     sources: NotRequired[List[dict]]
+
+    timings: NotRequired[dict]

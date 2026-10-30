@@ -16,9 +16,14 @@ from pathlib import Path
 
 from src.cache import get_semantic_cache, successful as cacheable_result
 from src.chain import RAGChain
+from src.previews import verified_cited_page_image
 from src.agent_graph import AgentRAGChain
 from src.retriever import database_error_message, resolve_render_path, high_confidence_visual
 
+from src.security import install_origin_security, RequestLimiter, configured_request_limit
+
+install_origin_security()
+_REQUEST_LIMITER = RequestLimiter(configured_request_limit())
 logger = logging.getLogger(__name__)
 
 
@@ -90,7 +95,10 @@ def slide_image_elements(result: dict) -> list[cl.Image]:
             continue
         if not isinstance(image, dict):
             continue
-        if not high_confidence_visual(image.get('dense_score')):
+        if image.get('preview_type') == 'cited_page':
+            if not verified_cited_page_image(image, result.get('sources', [])):
+                continue
+        elif not high_confidence_visual(image.get('dense_score')):
             continue
         # Recheck paths at display time: a file may have moved since retrieval.
         path = resolve_render_path({'render_path': image.get('path')})
@@ -162,6 +170,25 @@ async def on_chat_start():
 
 @cl.on_message
 async def on_message(msg: cl.Message):
+    # Acquire without awaiting: neither simultaneous session messages nor other
+    # sessions can create an unbounded queue of CPU/model work.
+    if cl.user_session.get('request_active'):
+        await deliver('Your previous question is still running. Please wait for it to finish.')
+        return
+    if not _REQUEST_LIMITER.acquire():
+        await deliver('The learning companion is busy. Please try again shortly.')
+        return
+    try:
+        cl.user_session.set('request_active', True)
+        await _process_message(msg)
+    finally:
+        try:
+            cl.user_session.set('request_active', False)
+        finally:
+            _REQUEST_LIMITER.release()
+
+
+async def _process_message(msg: cl.Message):
     reply = None
     elements = []
     cache = lookup = result = None
@@ -203,10 +230,10 @@ async def on_message(msg: cl.Message):
         # Normalize grouped citations and replace provisional text if the final
         # citation check refuses the answer. Attach sources/images only now.
         content = format_chat_answer(result)
-        elements = slide_image_elements(result)
+        elements = await cl.make_async(slide_image_elements)(result)
         response_succeeded = True
         if elements:
-            content += '\n\n**Retrieved slide previews**\n\nThese slides accompany the retrieved text. The answer above uses text evidence.'
+            content += '\n\n**Cited PDF previews**\n\nThese pages accompany the cited text. The answer above uses text evidence.'
     except Exception as exc:
         logger.warning('Chat request failed (%s)', type(exc).__name__)
         content = error_message(exc)

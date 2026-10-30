@@ -59,6 +59,52 @@ PROMPT = ChatPromptTemplate.from_messages([
 ])
 
 
+def safe_header(value: object) -> str:
+    """Escape metadata controls and reserved header delimiters on one line."""
+    text = re.sub(r'[\x00-\x1f\x7f\u2028\u2029]', ' ', str(value))
+    text = re.sub(r'\s+', ' ', text).strip()
+    for char, escaped in [('[', '&#91;'), (']', '&#93;'), ('<', '&lt;'), ('>', '&gt;')]:
+        text = text.replace(char, escaped)
+    return re.sub(r'-{3,}', lambda m: '&#45;' * len(m[0]), text)
+
+
+def safe_chunk_text(text: str) -> str:
+    """Escape reserved boundaries; ordinary multiline prose/code is unchanged.
+
+    This prevents syntactic boundary spoofing, not semantic prompt injection.
+    Literal reserved marker lines inside code are escaped as well.
+    """
+    text = re.sub(r'(?im)(?<![^\n\r\u2028\u2029])([ \t]*)(-{3,}[ \t]*(?:END[ \t]+)?SOURCE[ \t]+CHUNK\b[^\r\n\u2028\u2029]*)',
+                  lambda m: m[1] + m[2].replace('-', '&#45;'), text)
+    return re.sub(r'<\|(?:im_start|im_end|system|assistant|user|eot_id|start_header_id|end_header_id)\|>',
+                  lambda m: m[0].replace('<', '&lt;').replace('>', '&gt;'), text, flags=re.I)
+
+
+def active_claim_text(answer: str) -> str:
+    """Mask code and quotations, preserving offsets for citation normalization."""
+    def blank(text):
+        return ''.join(c if c in '\r\n' else ' ' for c in text)
+    lines, fence = [], None
+    for line in answer.splitlines(keepends=True):
+        match = re.match(r'^ {0,3}(`{3,}|~{3,})(.*)', line.rstrip('\r\n'))
+        if fence:
+            lines.append(blank(line))
+            if match and match[1][0] == fence[0] and len(match[1]) >= fence[1] and not match[2].strip():
+                fence = None
+        elif match:
+            fence = (match[1][0], len(match[1]))
+            lines.append(blank(line))
+        elif re.match(r'^ {0,3}>', line) or line.startswith(('    ', '\t')):
+            lines.append(blank(line))
+        else:
+            lines.append(line)
+    text = ''.join(lines)
+    text = re.sub(r'(`+)(?!`)(.*?)\1(?!`)', lambda m: blank(m[0]), text, flags=re.S)
+    text = re.sub(r'"(?:\\.|[^"\\\r\n])*"|“[^”\r\n]*”|‘[^’\r\n]*’|(?<!\w)\'[^\'\r\n]*\'(?!\w)',
+                  lambda m: blank(m[0]), text)
+    return text
+
+
 def source_label(metadata: dict) -> str:
     source = str(metadata.get('source') or 'Unknown source').replace('\\', '/')
     label = PurePosixPath(source).name
@@ -70,7 +116,7 @@ def source_label(metadata: dict) -> str:
         label += ' | ' + str(metadata['section']).replace('\n', ' ')
     if metadata.get('start'):
         label += f" | {metadata['start']}" + (f"-{metadata['end']}" if metadata.get('end') else '')
-    return label
+    return safe_header(label)
 
 
 def format_context(hits: list[dict], max_bytes: int = 5000) -> tuple[str, list[dict]]:
@@ -81,11 +127,18 @@ def format_context(hits: list[dict], max_bytes: int = 5000) -> tuple[str, list[d
             continue
         citation = f'S{len(sources) + 1}'
         label = source_label(hit.get('metadata', {}))
-        block = f'--- SOURCE CHUNK [{citation}] [File: {label}] ---\n{hit["text"]}'
+        parts = hit.get('metadata', {}).get('retrieval_parts', [])
+        parts = [str(p) for p in parts if isinstance(p, int) and not isinstance(p, bool) and 1 <= p <= 5] if isinstance(parts, list) else []
+        part_label = ' [Question parts: ' + ', '.join(parts) + ']' if parts else ''
+        block = f'--- SOURCE CHUNK [{citation}] [File: {label}]{part_label} ---\n{safe_chunk_text(hit["text"])}'
         length = len(block.encode('utf-8')) + (2 if blocks else 0)
         if size + length > max_bytes:
             continue
-        sources.append({'citation': citation, 'label': label, 'metadata': hit.get('metadata', {}), 'score': hit['score']})
+        source = {'citation': citation, 'label': label, 'metadata': hit.get('metadata', {}), 'score': hit['score']}
+        for source_key, hit_key in [('chunk_id', 'id'), ('rerank_score', 'rerank_score'), ('dense_score', 'dense_score')]:
+            if hit_key in hit:
+                source[source_key] = hit[hit_key]
+        sources.append(source)
         blocks.append(block)
         size += length
     return '\n\n'.join(blocks), sources
@@ -155,6 +208,35 @@ def filter_cited_images(images: list, sources: list[dict]) -> list:
     return selected
 
 
+def complete_cited_images(images: list, sources: list[dict]) -> list:
+    """Keep existing eligible previews and repair exact cited-page omissions.
+
+    No extra search, query rewriting, confidence fabrication or LLM call occurs.
+    Uncited, ambiguous, unsafe or rejected records cannot add images.
+    """
+    from .previews import cited_page_image
+    selected = filter_cited_images(images, sources)
+    seen = {image.get('path') if isinstance(image, dict) else image for image in selected}
+    for source in sources:
+        try:
+            image = cited_page_image(source)
+        except Exception:
+            # Rendering must never discard a valid text answer.
+            image = None
+        if image is not None and image['path'] not in seen:
+            selected.append(image)
+            seen.add(image['path'])
+    # Exact reference resolution may have repaired stale/wrong-page metadata.
+    selected = filter_cited_images(selected, sources)
+    order = {}
+    for index, source in enumerate(sources):
+        path = resolve_render_path(source.get('metadata', {}))
+        if path is not None:
+            order.setdefault(path, index)
+    selected.sort(key=lambda image: order.get(image.get('path') if isinstance(image, dict) else image, len(order)))
+    return selected
+
+
 class RAGChain:
     def __init__(self, *, settings: ProviderSettings | None = None, retriever=None, model=None, max_tokens: int | None = None):
         self.settings = settings or ProviderSettings.from_env()
@@ -199,9 +281,12 @@ class RAGChain:
     def _finish(answer: str, prepared: dict) -> dict:
         answer = answer.strip()
         sources = prepared['sources']
-        answer = re.sub(r'\[(S\d+(?:\s*[,;]\s*S\d+)*)\]',
-                        lambda match: ''.join(f'[{ref}]' for ref in re.findall(r'S\d+', match[1])), answer)
-        cited = set(re.findall(r'\[(S\d+)\]', answer))
+        # Normalize active IDs only; literal code/quote examples are preserved.
+        matches = list(re.finditer(r'\[(S\d+(?:\s*[,;]\s*S\d+)*)\]', active_claim_text(answer)))
+        for match in reversed(matches):
+            refs = ''.join(f'[{ref}]' for ref in re.findall(r'S\d+', match[1]))
+            answer = answer[:match.start()] + refs + answer[match.end():]
+        cited = set(re.findall(r'\[(S\d+)\]', active_claim_text(answer)))
         valid = {source['citation'] for source in sources}
         # Qwen can append the exact refusal after a cited partial answer. Honor
         # that admission of missing evidence for the whole request. Restrict the
@@ -214,7 +299,7 @@ class RAGChain:
         cited_sources = [] if refused else [source for source in sources if source['citation'] in cited]
         return {'answer': REFUSAL if refused else answer,
                 'sources': cited_sources,
-                'refused': refused, 'slide_images': filter_cited_images(prepared['slide_images'], cited_sources),
+                'refused': refused, 'slide_images': complete_cited_images(prepared['slide_images'], cited_sources),
                 'timings': prepared['timings']}
 
     def ask(self, query: str, *, top_k: int | None = None, candidates: int = 25, bm25_weight: float = 0.5) -> dict:
@@ -248,7 +333,7 @@ class RAGChain:
                 parts.append(token)
                 yield {'type': 'token', 'text': token}
         prepared['timings']['generation_seconds'] = time.perf_counter() - start
-        yield {'type': 'final', 'result': self._finish(''.join(parts), prepared)}
+        yield {'type': 'final', 'result': await asyncio.to_thread(self._finish, ''.join(parts), prepared)}
 
 
 def format_answer(result: dict) -> str:

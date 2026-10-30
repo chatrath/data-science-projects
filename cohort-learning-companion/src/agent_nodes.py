@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+import math
+from dataclasses import replace
 import os
 import re
 from pathlib import Path
@@ -9,6 +11,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from .agent_state import AgentState
+from .query_planning import explicit_question_parts, topic_terms, retrieval_wording
 from .provider import ProviderSettings, create_provider_client
 from .retriever import HybridRetriever, normalize_chunk, MIN_RERANK_SCORE
 from .chain import collect_source_images, PROMPT, REFUSAL, RAGChain, format_context
@@ -101,7 +104,7 @@ def _compound_explanation_queries(question: str) -> list[str] | None:
 def decompose_query(state: AgentState) -> dict:
     """Return a LangGraph partial update; model/validation failures keep the query."""
     question = state['question']
-    comparison = _comparison_queries(question) or _compound_explanation_queries(question)
+    comparison = _comparison_queries(question) or _compound_explanation_queries(question) or explicit_question_parts(question)
     if comparison is not None:
         return {'sub_queries': comparison, 'loop_step': state.get('loop_step', 0) + 1}
     sub_queries = [question]
@@ -132,9 +135,9 @@ def decompose_query(state: AgentState) -> dict:
 
 
 def retrieve_documents(state: AgentState) -> dict:
-    """Retrieve reranked evidence per query, sharing the configured top-k budget.
+    """Retrieve precise evidence with bounded, per-part allocation.
 
-    Round-robin merging gives each sub-query a chance to contribute without
+    Round-robin merging reserves question coverage within an adaptive cap without
     comparing cross-encoder logits from different queries. Documents remain
     strings as required by AgentState; image eligibility uses the original hits.
     LangGraph runs this synchronous node in a worker when invoked asynchronously.
@@ -153,20 +156,29 @@ def retrieve_documents(state: AgentState) -> dict:
         logger.warning('Retrieval initialization failed (%s)', type(exc).__name__)
         return empty
 
+    multi = len(queries) > 1
+    # Fall back to the old top-k interface for duck-typed legacy settings.
+    def setting(name, default):
+        value = getattr(settings, name, default)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else default
+    per_query = setting('rag_multi_chunks_per_query', settings.rag_top_k) if multi else settings.rag_top_k
+    limit = min(setting('rag_multi_max_chunks', settings.rag_top_k),
+                max(settings.rag_top_k, len(queries) * per_query)) if multi else settings.rag_top_k
+
     def heading_match(hit, query):
         # An explicit topic heading can disambiguate a broad reranker hit (for
         # example a definition versus a requested model list). Only reorder
         # evidence already admitted by the precision filter; never add a hit.
-        terms = re.findall(r"\w+", query.casefold())
-        if not 3 <= len(terms) <= 8:
+        terms = topic_terms(query)
+        if not 2 <= len(terms) <= 12:
             return False
-        return any(re.findall(r"\w+", line.casefold()) == terms
+        return any(topic_terms(line) == terms
                    for line in hit['text'].splitlines())
 
     pools = []
     for query in queries:
         try:
-            hits = retriever.search(query, top_k=settings.rag_top_k,
+            hits = retriever.search(retrieval_wording(query) if multi else query, top_k=settings.rag_top_k,
                                     candidates=max(25, settings.rag_top_k), rerank=True,
                                     min_rerank_score=MIN_RERANK_SCORE)
             pool = [hit for raw in hits
@@ -174,10 +186,19 @@ def retrieve_documents(state: AgentState) -> dict:
             if len(queries) > 1:
                 # Preserve coverage of each focused sub-question within top-k.
                 # Stable sorting retains reranker ordering for all other hits.
-                pool.sort(key=lambda hit: not heading_match(hit, query))
+                # The retriever returns rank 1,3,2 for context placement. Restore
+                # precision order before the per-question quota is applied.
+                def score(hit):
+                    value = hit.get('rerank_score', 0)
+                    return float(value) if isinstance(value, (int, float)) and math.isfinite(value) else 0
+                pool.sort(key=lambda hit: (not heading_match(hit, query), -score(hit)))
+            pool = pool[:per_query]
+            for hit in pool:
+                hit['metadata'] = {**hit['metadata'], 'retrieval_parts': [len(pools) + 1]}
             pools.append(pool)
         except Exception as exc:
             logger.warning('Sub-query retrieval failed (%s); continuing', type(exc).__name__)
+            pools.append([])
 
     selected, seen_ids, seen_text = [], set(), set()
     for rank in range(max((len(pool) for pool in pools), default=0)):
@@ -192,10 +213,24 @@ def retrieve_documents(state: AgentState) -> dict:
             seen_text.add(text.strip())
             if identity is not None:
                 seen_ids.add(str(identity))
-            if len(selected) == settings.rag_top_k:
+            if len(selected) == limit:
                 break
-        if len(selected) == settings.rag_top_k:
+        if len(selected) == limit:
             break
+
+    for hit in selected:
+        parts, cosines = set(), []
+        for pool in pools:
+            for candidate in pool:
+                if candidate['text'].strip() == hit['text'].strip() or (
+                        hit.get('id') is not None and candidate.get('id') == hit['id']):
+                    parts.update(candidate['metadata'].get('retrieval_parts', []))
+                    cosine = candidate.get('dense_score')
+                    if isinstance(cosine, (int, float)) and not isinstance(cosine, bool) and math.isfinite(cosine):
+                        cosines.append(cosine)
+        hit['metadata']['retrieval_parts'] = sorted(parts)
+        if cosines:
+            hit['dense_score'] = max(cosines)
 
     # Reuse the current cosine threshold, path validation and on-demand rendering.
     # A preview failure must not remove otherwise usable text evidence.
@@ -240,13 +275,37 @@ def _generation_context(state: AgentState, settings: ProviderSettings) -> dict:
             'text': text, 'score': 0, 'metadata': {'source': f'Retrieved course excerpt {i + 1}'}})
     question = state.get('question', '')
     overhead = len(PROMPT.invoke({'context': '', 'question': question}).to_string().encode('utf-8'))
-    budget = min(settings.rag_context_bytes,
-                 settings.ollama_num_ctx - settings.ollama_num_predict - overhead - 256)
+    queries = state.get('sub_queries') or [question]
+    multi = len(queries) > 1
+    target = settings.rag_multi_context_bytes if multi else settings.rag_context_bytes
+    budget = min(target, settings.ollama_num_ctx - settings.ollama_num_predict - overhead - 256)
+    # One representative per part gets first claim on the byte budget. Shared
+    # evidence may cover several parts. Extras follow; never truncate demo text.
+    if multi:
+        anchors, covered = [], set()
+        for part in range(1, len(queries) + 1):
+            if part in covered:
+                continue
+            hit = next((h for h in hits if part in h['metadata'].get('retrieval_parts', [])), None)
+            if hit is not None and hit not in anchors:
+                anchors.append(hit)
+                covered.update(hit['metadata'].get('retrieval_parts', []))
+        hits = anchors + [h for h in hits if h not in anchors]
     if budget <= 0:
         raise ValueError('OLLAMA_NUM_CTX is too small for the prompt and output budget')
     context, sources = format_context(hits, max_bytes=budget)
+    packed_parts = {part for source in sources for part in source['metadata'].get('retrieval_parts', [])}
+    retrieved_parts = {part for hit in hits for part in hit['metadata'].get('retrieval_parts', [])}
+    required_parts = set(range(1, len(queries) + 1)) if multi and retrieved_parts else retrieved_parts
+    missing = sorted(required_parts - packed_parts)
+    if missing:
+        logger.warning('Context capacity omitted all evidence for question parts %s', missing)
     return {'query': question, 'context': context, 'sources': sources,
-            'slide_images': list(state.get('slide_images', [])), 'timings': {}}
+            'coverage_complete': not missing,
+            'slide_images': list(state.get('slide_images', [])),
+            'timings': {'retrieved_chunks': len(hits), 'context_chunks': len(sources),
+                        'context_bytes': len(context.encode('utf-8')), 'context_budget_bytes': budget,
+                        'omitted_chunks': len(hits) - len(sources), 'unpacked_parts': missing}}
 
 
 def generate_answer(state: AgentState) -> dict:
@@ -262,8 +321,10 @@ def generate_answer(state: AgentState) -> dict:
         return {'generation': REFUSAL, 'sources': []}
     load_dotenv(ROOT / '.env')
     settings = ProviderSettings.from_env({**os.environ, 'LLM_PROVIDER': 'ollama'})
+    if len(state.get('sub_queries') or []) > 1:
+        settings = replace(settings, ollama_num_predict=max(settings.ollama_num_predict, settings.rag_multi_num_predict))
     prepared = _generation_context(state, settings)
-    if not prepared['sources']:
+    if not prepared['sources'] or not prepared['coverage_complete']:
         return {'generation': REFUSAL, 'sources': []}
     response = create_provider_client(settings).invoke(PROMPT.invoke({
         'context': prepared['context'], 'question': prepared['query'],
@@ -271,4 +332,7 @@ def generate_answer(state: AgentState) -> dict:
     if not isinstance(response.content, str):
         raise ValueError('Local generation returned non-text content')
     result = RAGChain._finish(response.content, prepared)
-    return {'generation': result['answer'], 'sources': result['sources']}
+    update = {'generation': result['answer'], 'sources': result['sources']}
+    if not result['refused']:
+        update['timings'] = prepared['timings']
+    return update

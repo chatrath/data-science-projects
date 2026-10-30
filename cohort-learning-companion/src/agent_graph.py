@@ -6,11 +6,13 @@ Each invocation starts fresh; no conversations share graph state.
 """
 from __future__ import annotations
 
+import asyncio
+
 from langgraph.graph import END, START, StateGraph
 
 from .agent_state import AgentState
 from .agent_nodes import decompose_query, retrieve_documents, grade_documents, generate_answer
-from .chain import REFUSAL, filter_cited_images
+from .chain import REFUSAL, complete_cited_images
 
 MAX_RETRIEVAL_ATTEMPTS = 2
 
@@ -44,15 +46,15 @@ graph = build_agent_graph()
 def agent_result(state: AgentState) -> dict:
     """Translate graph state without inventing source metadata or cosine scores.
 
-    retrieve_documents has already applied the cosine guardrail; paths are
-    revalidated here and again at display time. No paths appear in answer text.
+    Existing paths retain retrieval eligibility; missing exact cited-page previews
+    are completed here and verified again at display time. No paths appear in answer text.
     """
     answer = state.get('generation') or REFUSAL
     refused = answer == REFUSAL
     sources = [] if refused else state.get('sources', [])
-    paths = filter_cited_images(state.get('slide_images', []), sources)
+    paths = complete_cited_images(state.get('slide_images', []), sources)
     return {'answer': answer, 'sources': sources,
-            'refused': refused, 'slide_images': paths, 'timings': {}}
+            'refused': refused, 'slide_images': paths, 'timings': state.get('timings', {})}
 
 
 class AgentRAGChain:
@@ -76,4 +78,4 @@ class AgentRAGChain:
                 for update in payload.values():
                     if isinstance(update, dict):
                         state.update(update)
-        yield {'type': 'final', 'result': agent_result(state)}
+        yield {'type': 'final', 'result': await asyncio.to_thread(agent_result, state)}
