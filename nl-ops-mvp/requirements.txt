@@ -1,0 +1,13 @@
+langchain>=0.3,<2
+langgraph>=0.2,<2
+langchain-ollama>=0.3,<2
+langchain-community>=0.3,<1
+langsmith>=0.3,<1
+streamlit>=1.40,<2
+pandas>=2.2,<3
+pydantic>=2.7,<3
+python-dotenv>=1.0,<2
+sqlglot>=26,<31
+pytest>=8,<10
+aiosmtpd>=1.4.6,<2
+# sqlite3 is included in Python; do not install it with pip.
