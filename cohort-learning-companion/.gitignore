@@ -1,0 +1,16 @@
+corpus/
+.env
+__pycache__/
+*.py[cod]
+.venv/
+.local-db/
+.venv-ui/
+.env.*
+!.env.example
+.files/
+.chainlit/translations/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.log
