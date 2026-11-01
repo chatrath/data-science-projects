@@ -3,19 +3,103 @@ import config  # Load .env before LangGraph, including direct graph.invoke usage
 
 import logging
 import sqlite3
-from typing import TypedDict
+import json
+from typing import Annotated, TypedDict
 
 from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 
-from agents import ModelConfigurationError, check_intent, generate_sql
+from agents import ModelConfigurationError, check_intent, generate_sql, get_tool_model
 from database import MAX_ROWS, TABLES, read_only_connection, execute_query, get_schema
 from guardrails import inspect_query_plan, validate_sql
 from schema_context import get_relevant_schema
 from audit_logger import append_audit_event, request_identity
 from notifications import send_dba_alert
 from plan_artifacts import save_plan_artifacts
+from tools import AGENT_TOOLS
 
 logger = logging.getLogger(__name__)
+
+MAX_AGENT_TURNS = 6
+MAX_TOOL_CALLS = 8
+
+
+class ToolAgentState(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+    turns: int
+    tool_calls: int
+    required_tools: list[str]
+    retry: bool
+    error: str
+
+
+def _successful_tools(messages):
+    completed = set()
+    for message in messages:
+        if not isinstance(message, ToolMessage) or message.status == "error":
+            continue
+        try:
+            payload = json.loads(message.content)
+            if message.name == "get_table_metadata" and payload.get("ok"):
+                completed.add(message.name)
+            if message.name == "validate_sql_syntax" and payload.get("valid") and payload.get("policy_allowed"):
+                completed.add(message.name)
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return completed
+
+
+def tool_agent_node(state: ToolAgentState) -> dict:
+    if state["turns"] >= MAX_AGENT_TURNS:
+        return {"error": "Agent exceeded the bounded tool-calling turn limit."}
+    response = get_tool_model().invoke(state["messages"])
+    if not isinstance(response, AIMessage) or response.invalid_tool_calls:
+        return {"error": "Agent returned malformed tool calls or an invalid response."}
+    calls = state["tool_calls"] + len(response.tool_calls)
+    if calls > MAX_TOOL_CALLS or len(response.tool_calls) > 4:
+        return {"error": "Agent exceeded the tool-call budget."}
+    messages = [response]
+    missing = set(state["required_tools"]) - _successful_tools(state["messages"])
+    retry = not response.tool_calls and bool(missing)
+    if retry:
+        messages.append(HumanMessage(content="Before a final answer, successfully invoke these required tools: "
+                                             + ", ".join(sorted(missing)) + ". Use their results; do not guess."))
+    return {"messages": messages, "turns": state["turns"] + 1, "tool_calls": calls, "retry": retry}
+
+
+def _tool_route(state: ToolAgentState):
+    if state.get("error"):
+        return END
+    if state.get("retry"):
+        return "agent"
+    return tools_condition(state)
+
+
+def build_tool_agent_graph():
+    builder = StateGraph(ToolAgentState)
+    builder.add_node("agent", tool_agent_node)
+    builder.add_node("tools", ToolNode(AGENT_TOOLS, handle_tool_errors="Tool invocation failed. Check the tool name and arguments; do not invent results."))
+    builder.add_edge(START, "agent")
+    builder.add_conditional_edges("agent", _tool_route)
+    builder.add_edge("tools", "agent")
+    return builder.compile()
+
+
+tool_agent_graph = build_tool_agent_graph()
+
+
+def run_agent_tools(messages, run_name, required_tools=()):
+    result = tool_agent_graph.invoke({"messages": messages, "turns": 0, "tool_calls": 0,
+                                     "required_tools": list(required_tools), "retry": False, "error": ""},
+                                    config={"run_name": run_name, "recursion_limit": 25})
+    if result.get("error"):
+        raise ValueError(result["error"])
+    final = result["messages"][-1]
+    if not isinstance(final, AIMessage) or final.tool_calls:
+        raise ValueError("Agent did not finish with a final response.")
+    return final
 
 
 class WorkflowState(TypedDict, total=False):

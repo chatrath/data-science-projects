@@ -78,6 +78,25 @@ def get_schema(path: Path = DB_PATH) -> str:
     return "\n".join(definitions)
 
 
+def get_table_metadata(table_name: str, path: Path = DB_PATH) -> dict:
+    """Trusted metadata/count lookup; identifiers are checked before SQL use."""
+    name = table_name.strip().casefold()
+    if name not in TABLES:
+        raise ValueError("Table is outside the allowed table list.")
+    uri = Path(path).resolve().as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True, timeout=2)) as conn:
+        conn.execute("PRAGMA query_only = ON")
+        with closing(conn.execute(f'PRAGMA table_info("{name}")')) as cursor:
+            columns = [{"name": row[1], "type": row[2], "primary_key": bool(row[5]),
+                        "nullable": not bool(row[3] or row[5])} for row in cursor.fetchall()]
+    if not columns:
+        raise ValueError("Requested table does not exist in the database.")
+    with read_only_connection(path) as conn:
+        with closing(conn.execute(f'SELECT COUNT(*) FROM "{name}"')) as cursor:
+            count = cursor.fetchone()[0]
+    return {"table": name, "columns": columns, "row_count": count}
+
+
 def dry_run(sql: str, path: Path = DB_PATH) -> None:
     """Compile the query with the same authorizer used for execution."""
     sql = _validate(sql)

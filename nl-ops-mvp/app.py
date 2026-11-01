@@ -1,18 +1,16 @@
 """Streamlit helpdesk interface for the NL-Ops workflow."""
-from config import TRACING_ENABLED, TRACING_PROJECT, log_tracing_status
-from cache import initialize_cache, run_cached, clear_caches
+from config import log_tracing_status
+from cache import initialize_cache, run_cached
 
 initialize_cache()  # Must run before graph/agents instantiate LangChain components.
 
 import logging
-import os
 
 import pandas as pd
 import streamlit as st
 
-from database import DB_PATH, MAX_ROWS, initialize_database
+from database import DB_PATH, initialize_database
 from graph import graph, notify_failure_node
-from tracing import verify_tracing
 from audit_logger import append_audit_event, read_recent_audit_logs, request_identity
 from smtp_inbox import read_local_inbox
 from plan_artifacts import save_plan_artifacts
@@ -30,13 +28,13 @@ def show_plan_links(links):
 
 logging.basicConfig(level=logging.INFO)
 log_tracing_status()
-st.set_page_config(page_title="NL-Ops Helpdesk", page_icon="🎫", layout="wide")
+st.set_page_config(page_title="NL-Ops Helpdesk", page_icon="🎫", layout="wide", initial_sidebar_state="collapsed")
 st.title("🎫 NL-Ops Helpdesk")
 st.caption("Submit a read-only data request to your mock enterprise helpdesk.")
 try:
     plan_download_service()
 except (OSError, ValueError):
-    st.warning("Plan downloads are unavailable. Check that local port 8502 is free.")
+    logging.exception("Audit/DBA plan downloads unavailable; check local port 8502")
 
 try:
     initialize_database()
@@ -45,31 +43,8 @@ except Exception:
     st.error("Could not initialize the mock database. Check folder write permissions.")
     st.stop()
 
-with st.sidebar:
-    st.header("Request settings")
-    st.caption(f"Local model: {os.getenv('OLLAMA_MODEL', 'qwen3:4b-instruct')}")
-    if TRACING_ENABLED:
-        st.info(f"LangSmith tracing configured · Project: {TRACING_PROJECT}")
-        st.caption("Use Verify tracing to confirm remote delivery.")
-    else:
-        st.warning(f"LangSmith inactive · Project: {TRACING_PROJECT}. Add your LangSmith key and restart.")
-    if st.button("Verify LangSmith tracing"):
-        with st.spinner("Checking trace upload and readback…"):
-            verification = verify_tracing()
-        if verification.startswith("Verified:"):
-            st.success(verification)
-        else:
-            st.warning(verification)
-    st.link_button("Open LangSmith dashboard", "https://smith.langchain.com/")
-    row_limit = st.slider("Maximum rows", 1, MAX_ROWS, 50)
-    st.caption("Local SQLite caching enabled · Result lifetime: 5 minutes")
-    if st.button("Clear local caches"):
-        clear_caches()
-        st.session_state.pop("result", None)
-        st.success("LLM and query result caches cleared.")
-    st.caption("Synthetic employees, customers, and IT tickets. Data changes are blocked.")
-    st.caption("Example: Show me all users who signed up in Europe last week.")
-    st.caption(f"DBA email SMTP: {os.getenv('SMTP_SERVER', 'localhost')}:{os.getenv('SMTP_PORT', '587')}")
+# Keep requests bounded without exposing operational settings in the UI.
+row_limit = 50
 
 with st.form("ticket"):
     request = st.text_area("How can we help?", placeholder="Show open IT tickets with employee names", max_chars=4000)
@@ -81,6 +56,10 @@ if submitted:
         result = inflight
         for update in graph.stream(result, config={"run_name": "NL-Ops Helpdesk Request"}, stream_mode="updates"):
             for node, values in update.items():
+                # Nodes that return no state changes can stream a None delta.
+                # This is normal (e.g. no failure notification is necessary).
+                if values is None:
+                    continue
                 result.update(values)
                 st.write(f"{node.replace('_', ' ').title()}: {values.get('status', result.get('status', 'ready'))}")
         return result
@@ -105,14 +84,15 @@ if "result" in st.session_state:
     st.subheader("Execution result")
     st.write(f"Status: **{result['status']}**")
     if "cache_source" in result:
-        st.info(f"Source: {result['cache_source']} · LLM cache hits: {result['llm_cache_hits']} · {result['elapsed_seconds']:.3f}s")
+        cached_result = result["cache_source"] == "result cache"
+        source = {"result cache": "Saved result", "agents / LLM cache": "Cached LLM responses",
+                  "live agents": "Live agents"}.get(result["cache_source"], result["cache_source"])
+        execution = "Database Hit" if not cached_result and result.get("execution_status") in {"Success", "Blocked", "Error"} else "Skipped"
+        st.info(f"**Source -** {source}  \n"
+                f"**Agents and Database execution -** {execution}  \n"
+                f"**Request duration -** {result['elapsed_seconds']:.3f} seconds")
     if result.get("sql"):
         st.code(result["sql"], language="sql")
-    if result.get("plan_message"):
-        st.caption(f"Pre-execution plan inspection: {result['plan_message']}")
-    show_plan_links(result.get("plan_links", {}))
-    if result.get("dba_alert", {}).get("status") not in (None, "NotNeeded"):
-        st.caption(f"DBA alert: {result['dba_alert']['status']}. {result['dba_alert'].get('message', '')}")
     if result["status"] == "completed":
         st.success(result["message"])
         st.dataframe(pd.DataFrame(result["rows"], columns=result["columns"]), use_container_width=True, hide_index=True)

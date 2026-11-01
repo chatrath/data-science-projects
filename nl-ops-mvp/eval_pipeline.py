@@ -23,6 +23,7 @@ from agents import SafetyDecision, get_model
 import audit_logger
 import database
 import graph as workflow
+import tools as agent_tools
 from guardrails import validate_sql
 from notifications import send_dba_alert
 from schema_context import SCHEMA_CATALOG
@@ -145,6 +146,7 @@ def run_evaluation(dataset_path=DATASET_PATH, *, offline=False, audit_path=None,
         stack.enter_context(patch.object(workflow, "get_schema", side_effect=lambda: database.get_schema(db_path)))
         stack.enter_context(patch.object(workflow, "read_only_connection", side_effect=lambda: database.read_only_connection(db_path)))
         stack.enter_context(patch.object(workflow, "execute_query", side_effect=lambda sql, limit: database.execute_query(sql, limit, db_path)))
+        stack.enter_context(patch.object(agent_tools, "read_table_metadata", side_effect=lambda table: database.get_table_metadata(table, db_path)))
         stack.enter_context(patch.object(workflow, "send_dba_alert", side_effect=record_alert))
         stack.enter_context(patch.object(audit_logger, "AUDIT_PATH", target_audit))
         if offline:

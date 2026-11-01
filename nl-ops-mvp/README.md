@@ -16,6 +16,8 @@ Copy-Item .env.example .env
 ```
 
 This MVP uses local Ollama models with no OpenAI account or API key.
+The UI has no sidebar; each request returns up to 50 rows by default.
+Tracing, caching, and SMTP are configured outside the UI through `.env` and CLI utilities.
 The installed model store is `D:\Ollama\models`. The existing Ollama service
 serves these models at `http://127.0.0.1:11434`.
 
@@ -60,10 +62,9 @@ to explicitly disable tracing.
    If you use `LANGSMITH_*` aliases, they take priority over `LANGCHAIN_*` names.
 3. Fully stop and restart Streamlit after changing settings. `config.py` loads
    the project `.env` before LangChain/LangGraph imports for both the UI and
-   direct graph use. The sidebar shows the destination project and whether
-   tracing is configured. The server log reports the same status without keys.
-4. Click **Verify LangSmith tracing** in the sidebar, or run
-   `python tracing.py`. The check uploads a small synthetic verification run,
+   direct graph use. The server log reports the tracing configuration and destination project without keys.
+   The UI has no tracing controls; use the LangSmith console directly.
+4. Run `python tracing.py` from the project folder to verify tracing. The check uploads a small synthetic verification run,
    reads it back, and displays a run ID on success. Configured status alone
    does not confirm credentials or remote delivery. If verification fails,
    check the key's workspace permissions, endpoint/region, and network access.
@@ -147,7 +148,7 @@ can be up to five minutes old; clear caches when immediate freshness matters.
 The result panel reports **result cache**, **live agents**, or **agents / LLM
 cache**, with actual LLM cache-hit counts and elapsed time. Result-cache hits
 bypass the graph, so they do not generate a new agent trace in LangSmith.
-Use **Clear local caches** in the sidebar to reset both caches, or run:
+To reset both local caches from the project folder, run:
 
 ```powershell
 python cache.py
@@ -283,6 +284,47 @@ requests and SQL, but no result rows or API credentials. This MVP uses a local
 file and an in-process lock, without authentication, cross-process locking,
 retention rotation, or tamper evidence. Production compliance would require
 appropriate access controls and a managed append-only audit destination.
+
+## Native LLM tool calling
+
+Both agents bind the decorated functions in `tools.py` using
+`ChatOllama.bind_tools(...)`. This preserves the installed local model and
+requires no OpenAI API key. The configured model must support native function
+calling (`qwen3:4b-instruct` does).
+
+- `get_table_metadata(table_name)` returns real SQLite column names/types,
+  primary-key/nullability flags, and a row count for an allowlisted table.
+  It returns no employee/customer data rows. Schema inspection uses a trusted
+  read-only connection; the COUNT uses the existing authorized reader and time
+  budget. The identifier is checked before interpolation.
+- `validate_sql_syntax(sql_query)` parses SQLite SQL with SQLGlot and returns
+  syntax validity, errors, and a separate read-only/table policy decision. It
+  never executes SQL. Valid syntax alone does not imply permitted SQL.
+
+Inside `graph.py`, each agent invokes a compiled tool subgraph:
+`agent → tools (ToolNode) → agent`. `tools_condition` routes native tool calls;
+ToolNode dispatches the selected Python function and feeds matching ToolMessages
+back into the conversation. Final JSON is validated with the existing Pydantic
+schemas. The safety agent can inspect metadata when needed. The SQL agent must
+successfully inspect metadata and lint a candidate before finalizing; if it
+tries to skip those calls, the graph requests the missing tools rather than
+silently accepting an unverified answer.
+
+The loop allows at most six model turns, eight tool calls total, and four calls
+in one model response. Tool/argument errors return sanitized error messages to
+the model. Budget exhaustion or malformed final JSON fails closed through the
+normal failure/audit/DBA-alert path. Tool results do not replace the independent
+AST validator, EXPLAIN inspection, or read-only execution boundary. No execution
+tool is exposed to the model.
+
+Tool subgraphs and tool runs appear under the named agent traces in LangSmith.
+The UI result cache still skips the full graph on a hit; model-cache misses or
+direct graph runs may inspect current metadata before generating SQL. Changes
+to `tools.py` invalidate saved workflow results. Live evaluation redirects tool
+metadata reads to its disposable database, while offline evaluation substitutes
+reference agent outputs. `tests/test_tool_calling.py` exercises actual tool
+dispatch with scripted native model messages, including full guarded execution,
+unauthorized metadata requests, unknown tools, and loop-limit behavior.
 
 ## Structured schema context
 

@@ -5,6 +5,7 @@ import sqlite3
 from unittest.mock import patch
 
 from langchain_core.runnables import RunnableLambda
+from langchain_core.messages import AIMessage
 
 from agents import SQLQuery, generate_sql
 from database import initialize_database
@@ -68,14 +69,18 @@ def test_graph_injects_scoped_context_not_raw_schema():
 
 def test_sql_agent_receives_structured_prompt():
     captured = []
-    def fake_model(prompt):
-        captured.append(prompt.to_messages()[0].content)
-        return SQLQuery(sql="SELECT name FROM employees WHERE id=1")
+    def fake_model(messages):
+        captured.append(messages[0].content)
+        if len(captured) == 1:
+            return AIMessage(content="", tool_calls=[{"name": "get_table_metadata", "args": {"table_name": "employees"}, "id": "metadata"}])
+        if len(captured) == 2:
+            return AIMessage(content="", tool_calls=[{"name": "validate_sql_syntax", "args": {"sql_query": "SELECT name FROM employees WHERE id=1"}, "id": "lint"}])
+        return AIMessage(content='{"sql":"SELECT name FROM employees WHERE id=1"}')
     class Model:
-        def with_structured_output(self, *args, **kwargs):
+        def bind_tools(self, *args, **kwargs):
             return RunnableLambda(fake_model)
     context = get_relevant_schema("Show employee 1")
-    with patch("agents.get_model", return_value=Model()):
+    with patch("agents.get_model", return_value=Model()), patch("tools.read_table_metadata", return_value={"table": "employees", "columns": [], "row_count": 3}):
         assert generate_sql("Show employee 1", context, 50).startswith("SELECT")
     assert context in captured[0]
     assert '"customers"' not in captured[0]

@@ -51,7 +51,7 @@ def result_key(request, row_limit, database_path):
     digest = hashlib.sha256()
     for path in [Path(database_path), Path(str(database_path) + "-wal"),
                  ROOT / "agents.py", ROOT / "graph.py", ROOT / "database.py", ROOT / "guardrails.py",
-                 ROOT / "schema_context.py", ROOT / "query_plan.py", ROOT / "plan_artifacts.py"]:
+                 ROOT / "schema_context.py", ROOT / "query_plan.py", ROOT / "plan_artifacts.py", ROOT / "tools.py"]:
         digest.update(str(path.resolve()).encode())
         if path.exists():
             digest.update(path.read_bytes())
