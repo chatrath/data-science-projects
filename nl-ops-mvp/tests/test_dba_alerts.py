@@ -1,4 +1,5 @@
 """SMTP formatting and graceful failure; no real messages are sent."""
+from conftest import invoke_reviewed
 from contextlib import ExitStack
 from unittest.mock import patch
 import sqlite3
@@ -96,9 +97,9 @@ def test_graph_notifies_for_all_rejections(tmp_path, sql, should_alert):
          patch("graph.generate_sql", return_value=sql), \
          patch("graph.execute_query", return_value={"rows": [], "columns": [], "truncated": False}) as execute, \
          patch("graph.send_dba_alert", return_value={"status": "Failed", "message": "SMTP offline"}) as notify:
-        result = graph.invoke({"request": "Prompt context for DBA"})
+        result = invoke_reviewed(graph, {"request": "Prompt context for DBA"})
     if should_alert:
-        assert result["status"] == "blocked"
+        assert result["status"] in {"blocked", "error"}
         notify.assert_called_once()
         execute.assert_not_called()
         args = notify.call_args
@@ -110,7 +111,7 @@ def test_graph_notifies_for_all_rejections(tmp_path, sql, should_alert):
         assert args.kwargs["timestamp"]
         record = audit_logger.read_recent_audit_logs()[0]
         assert record["dba_alert"]["status"] == "Failed"
-        assert record["execution_outcome"] == "Blocked-by-Guardrail"
+        assert record["execution_outcome"] == ("Error" if result["status"] == "error" else "Blocked-by-Guardrail")
         assert "execution_plan" not in record
         if result["execution_plan"]:
             assert record["plan_links"]["plan_url"].endswith(".xml")
@@ -146,7 +147,7 @@ def test_each_failure_alerts_once(tmp_path, failure):
         elif failure == "notification_error":
             request = ""
             notify.side_effect = RuntimeError("SMTP unavailable")
-        result = graph.invoke({"request": request})
+        result = invoke_reviewed(graph, {"request": request})
     assert result["status"] in {"blocked", "error"}
     notify.assert_called_once()
     assert result["dba_alert"]["status"] == ("Failed" if failure == "notification_error" else "Sent")

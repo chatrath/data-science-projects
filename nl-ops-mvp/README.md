@@ -2,7 +2,7 @@
 
 A Python 3.10+ Streamlit helpdesk with two LangChain agents and a compiled
 LangGraph workflow: input → intent/safety → SQL generation → SQLGlot validation → EXPLAIN plan inspection
-and execution → response formatting. Blocked and failed stages route directly
+→ human SQL approval → execution → response formatting → audit logging. Blocked and failed stages route directly
 to the response. Results are formatted locally without sending rows to the LLM.
 
 ## Setup (PowerShell)
@@ -114,9 +114,14 @@ Germany, and France represented in this dataset.
 Run from Python after initializing the database:
 
 ```python
-from graph import graph
-result = graph.invoke({"request": "Show average salary by department", "row_limit": 50})
-print(result["status"], result["message"])
+from graph import start_request, resume_request
+
+thread_id, state = start_request("Show employee 1's name", row_limit=50)
+if state["status"] == "awaiting_approval":
+    print(state["sql"])  # Present this to the reviewer.
+    # Call only after an explicit human decision:
+    state = resume_request(thread_id, "approve", state["approval_token"])
+print(state["status"], state["message"])
 ```
 
 ## Local caching
@@ -130,14 +135,11 @@ and model settings. Non-streaming model calls enable caching; graph node status
 updates still stream to the UI. Both agents use this cache, including direct
 `graph.invoke()` calls.
 
-The UI additionally stores completed workflow results in `.query_cache.db` for
-five minutes. Identical requests (ignoring outer whitespace) with the same row
-limit return their saved SQL and rows without rerunning either agent or querying
-the enterprise database. This still reads the local cache database. Cache keys
-include the enterprise database file/WAL content fingerprint, model/endpoint,
-date, and agent/graph/database source code. Data/schema changes invalidate saved
-results automatically. Failed and blocked requests are never stored as completed
-results. Direct graph calls use the LLM cache but still execute SQL.
+The approval-enabled UI deliberately does not call the workflow-result cache:
+every new request is validated and reviewed before SQL execution. The exact
+result-cache utility remains available to other callers, but must not wrap a
+paused graph because a pending approval is not a completed request.
+LLM-response caching remains enabled; it does not skip validation or approval.
 
 This is **exact caching, not embedding-based semantic caching**. Paraphrases may
 miss; differences in names, numbers, negation, case, or quoted values are never
@@ -490,3 +492,97 @@ test dataset; they are not guarantees for all possible prompts.
 ```powershell
 python -m pytest tests test_enterprise_eval.py -q
 ```
+
+
+## Checkpointed human approval (Week 3)
+
+There is one canonical business workflow in `graph.py`. `enterprise_graph` is an
+alias for `graph`, not a separate flow or state contract. Both use `WorkflowState`
+and accept `request`/`row_limit`. `build_graph(checkpointer=MemorySaver())` is useful
+for isolated tests; MemorySaver only survives within the running process.
+The default graph uses `SqliteSaver` and `.workflow_checkpoints.db` so pending
+requests survive server restarts. Keep that file private and persistent.
+
+The flow is input → safety → targeted schema retrieval → generation → SQL policy
+validation → EXPLAIN plan → prepare approval → interrupt → execution → response
+→ failure notification when applicable → terminal audit. Correctable parser and
+SQLite errors return to generation, with a maximum of three failed corrections.
+Security and performance policy rejections stop without executing SQL.
+
+Each submission has a fresh `thread_id` which is also its request ID. Streamlit
+retains that ID in session state, reads the saved snapshot on reruns, and shows
+Approve and execute, Reject request, or Validate revised SQL. Edited SQL returns
+to policy and plan checks, then pauses for a new approval token. Three human edits
+are permitted. Approval applies to the exact SQL in that review, and execution
+rechecks policy and the plan after the pause. Rejection is a terminal audited
+outcome and does not dispatch a database-failure alert.
+
+For low-level LangGraph use, compile with a checkpointer, supply
+`config={"configurable": {"thread_id": request_id}, "recursion_limit": 64}`,
+and resume using `graph.invoke(Command(resume={"action": "approve",
+"approval_token": token}), config)`. Use the same thread ID. Do not pass fresh
+input on resume, `Command(goto=...)`, or `update_state` to bypass validation.
+Prefer `start_request` and `resume_request`, which serialize decisions locally and
+make duplicate terminal submissions no-ops. These helpers return checkpoint state
+rather than a raw interrupt payload. A stale review token is rejected.
+
+Audit appends are idempotent by request ID in this single-process application.
+No external effects occur before `interrupt()` in the approval node. SQL execution
+is read-only; a process crash between execution and its checkpoint can replay that
+read. The implementation does not claim transactional exactly-once database IO.
+For multiple server workers, use an appropriate shared checkpointer, authenticated
+reviewer/request ownership, distributed coordination, and transactional audit
+storage. The local Streamlit reviewer is not an enterprise authentication system.
+
+A new browser session after server restart needs the original thread ID to recover
+a pending request through the Python runner; browser session state itself is not
+stored by the graph. Do not expose unrestricted thread-ID lookup in a public UI.
+The evaluation harness uses a clearly labelled simulated reviewer against its
+temporary database. It never disables the application approval gate.
+
+
+## Recovery lifecycle and failure evidence
+
+`run_state` describes request lifecycle independently of the terminal `status`:
+
+| run_state | Meaning | Next action |
+| --- | --- | --- |
+| running | Work is in progress | Read the checkpoint |
+| awaiting_approval | Validated SQL is waiting for review | Approve, reject, or edit |
+| failed_recoverable | A temporary failure has saved progress | Retry saved request or cancel |
+| finished | Completed, rejected, blocked, or exhausted | Display the terminal status |
+
+`get_request_state(thread_id)` reads these states without executing anything.
+Use `recover_request(thread_id, recovery_token=state["recovery_token"])` to retry
+a saved transient failure. Use `action="cancel"` to stop it. This is separate
+from `resume_request`, which is exclusively for SQL review. Neither operation
+can authorize the other's pause. Recovery tokens change on each failure so old
+browser decisions cannot replay a retry. Reruns never retry automatically.
+There are at most three explicit recovery retries for the whole request, separate
+from SQL correction, tool-call, and human-edit budgets. A new generation always
+requires its own validation and approval, even after a prior execution failure.
+
+The recovery interrupt retains the failed node, pre-failure status, SQL, review
+history, and verified tool transcript. Retrying audit persistence only writes the
+audit; it never executes SQL again. Unexpected escaped task failures are recorded
+as failures of that task and routed into the same recovery protocol by the runner.
+For an interrupted native checkpoint between nodes, `recover_request(thread_id)`
+resumes with `invoke(None, config)` instead of passing fresh initial input.
+Successful upstream nodes are not replayed. If the checkpoint store itself fails,
+the runner raises instead of claiming progress was saved.
+
+`workflow_errors.py` classifies timeout, model_format, tool, database, configuration,
+SQL syntax, and infrastructure errors. Security/performance policy rejections stay
+terminal. Missing-column/syntax failures trigger SQL correction; database locks
+trigger checkpoint recovery instead of needless SQL regeneration. Audit records
+include error categories, chronological failure history, and recovery counts.
+Audit JSON serialization errors are infrastructure/data failures, not model errors;
+original file IO failures propagate to the graph for classified recovery. A torn
+trailing JSONL record is separated before writing a complete replayed record.
+
+Structured-output repair receives the full preceding tool conversation, including
+metadata, tool-call IDs, failed tool messages, and the exact SQL validation result.
+Model timeouts carry serialized tool state through the outer SQLite checkpoint;
+recovery preserves already verified metadata and the agent's tool/turn budgets.
+Tool results remain untrusted data, and repaired SQL still passes the independent
+SQL guardrails and human review before execution.

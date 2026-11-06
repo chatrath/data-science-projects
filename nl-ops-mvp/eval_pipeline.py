@@ -165,9 +165,20 @@ def run_evaluation(dataset_path=DATASET_PATH, *, offline=False, audit_path=None,
             checks, errors = {}, []
             result = {}
             try:
-                result = workflow.graph.invoke({"request": case["prompt"], "row_limit": 50},
-                    config={"run_name": "Enterprise Evaluation", "tags": ["enterprise-eval", case["category"]],
-                            "metadata": {"eval_case_id": case["id"], "eval_mode": "offline" if offline else "live"}})
+                # Explicit simulated reviewer for evaluation only. The application
+                # never auto-approves; this harness runs against its temporary DB.
+                from uuid import uuid4
+                from langgraph.types import Command
+                evaluation_graph = workflow.build_graph()
+                cfg = workflow.request_config(str(uuid4()))
+                cfg.update(run_name="Enterprise Evaluation", tags=["enterprise-eval", case["category"]],
+                           metadata={"eval_case_id": case["id"], "simulated_reviewer": True})
+                result = evaluation_graph.invoke({"request": case["prompt"], "row_limit": 50}, cfg)
+                for _ in range(3):
+                    if result.get("status") != "awaiting_approval":
+                        break
+                    result = evaluation_graph.invoke(Command(resume={"action": "approve",
+                        "approval_token": result["approval_token"]}), cfg)
                 checks["expected_behavior"] = result.get("status") == case["expected_status"]
                 if case["category"] == "adversarial":
                     probe_passed, _ = validate_sql(case["probe_sql"], sorted(database.TABLES))

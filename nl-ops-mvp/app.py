@@ -1,6 +1,6 @@
 """Streamlit helpdesk interface for the NL-Ops workflow."""
 from config import log_tracing_status
-from cache import initialize_cache, run_cached
+from cache import initialize_cache
 
 initialize_cache()  # Must run before graph/agents instantiate LangChain components.
 
@@ -9,9 +9,9 @@ import logging
 import pandas as pd
 import streamlit as st
 
-from database import DB_PATH, initialize_database
-from graph import graph, notify_failure_node
-from audit_logger import append_audit_event, read_recent_audit_logs, request_identity
+from database import initialize_database
+from graph import graph, start_request, resume_request, request_config, get_request_state, recover_request
+from audit_logger import read_recent_audit_logs
 from smtp_inbox import read_local_inbox
 from plan_artifacts import save_plan_artifacts
 from plan_server import start_plan_server
@@ -28,8 +28,8 @@ def show_plan_links(links):
 
 logging.basicConfig(level=logging.INFO)
 log_tracing_status()
-st.set_page_config(page_title="NL-Ops Helpdesk", page_icon="🎫", layout="wide", initial_sidebar_state="collapsed")
-st.title("🎫 NL-Ops Helpdesk")
+st.set_page_config(page_title="NL-Ops Helpdesk", page_icon="\U0001f3ab", layout="wide", initial_sidebar_state="collapsed")
+st.title("\U0001f3ab NL-Ops Helpdesk")
 st.caption("Submit a read-only data request to your mock enterprise helpdesk.")
 try:
     plan_download_service()
@@ -50,57 +50,85 @@ with st.form("ticket"):
     request = st.text_area("How can we help?", placeholder="Show open IT tickets with employee names", max_chars=4000)
     submitted = st.form_submit_button("Submit request", type="primary")
 
+# Persist the request/thread ID before starting. A rerun reads the checkpoint;
+# it never starts another run or audits an interrupt as a terminal failure.
 if submitted:
-    inflight = {**request_identity(request), "request": request, "row_limit": row_limit}
-    def run_live():
-        result = inflight
-        for update in graph.stream(result, config={"run_name": "NL-Ops Helpdesk Request"}, stream_mode="updates"):
-            for node, values in update.items():
-                # Nodes that return no state changes can stream a None delta.
-                # This is normal (e.g. no failure notification is necessary).
-                if values is None:
-                    continue
-                result.update(values)
-                st.write(f"{node.replace('_', ' ').title()}: {values.get('status', result.get('status', 'ready'))}")
-        return result
+    if st.session_state.get("result", {}).get("run_state", st.session_state.get("result", {}).get("status")) in {"awaiting_approval", "failed_recoverable"}:
+        st.warning("Resolve the pending request before starting another.")
+    else:
+        from uuid import uuid4
+        st.session_state["active_request_id"] = str(uuid4())
+        st.session_state["pending_request"] = request
 
+active_id = st.session_state.get("active_request_id")
+if active_id:
     try:
-        with st.status("Processing helpdesk request…", expanded=True) as progress:
-            result = run_cached(request, row_limit, run_live, DB_PATH)
-            progress.update(label="Request processed", state="complete" if result.get("status") == "completed" else "error", expanded=False)
-        st.session_state["result"] = result
+        snapshot = graph.get_state(request_config(active_id))
+        if not snapshot.values and "pending_request" in st.session_state:
+            with st.status("Preparing your query for review…", expanded=True) as progress:
+                _, result = start_request(st.session_state["pending_request"], row_limit, thread_id=active_id)
+                progress.update(label="Ready for review" if result.get("status") == "awaiting_approval" else "Request processed",
+                                state="complete" if result.get("status") == "awaiting_approval" else "error", expanded=False)
+            st.session_state["result"] = result
+        elif snapshot.values:
+            st.session_state["result"] = get_request_state(active_id)
     except Exception:
-        logging.exception("Workflow failed")
-        failed = {**inflight, "status": "error", "message": "Workflow failed. Check server logs and retry."}
-        failed.update(notify_failure_node(failed))
-        st.session_state["result"] = failed
-        try:
-            append_audit_event(failed)
-        except (OSError, ValueError, TypeError):
-            st.error("Enterprise audit persistence also failed. Check disk space and file permissions.")
+        logging.exception("Checkpointed workflow failed")
+        st.warning("The request could not complete. Its checkpoint is retained; please contact support before retrying.")
 
-if "result" in st.session_state:
+if st.session_state.get("result", {}).get("run_state") == "failed_recoverable":
+    failure = st.session_state["result"]
+    st.warning(failure.get("message", "The request paused after a temporary failure."))
+    retry = st.button("Retry saved request", type="primary")
+    cancel = st.button("Cancel recovery", disabled=failure.get("recovery_mode") == "checkpoint")
+    if retry or cancel:
+        try:
+            st.session_state["result"] = recover_request(
+                active_id, "retry" if retry else "cancel", failure.get("recovery_token", ""))
+            st.rerun()
+        except Exception:
+            logging.exception("Checkpoint recovery failed")
+            st.warning("Recovery could not complete. The saved request has been retained.")
+
+if st.session_state.get("result", {}).get("status") == "awaiting_approval":
+    pending = st.session_state["result"]
+    st.subheader("Review query")
+    st.info("Security and performance checks passed. Review the query before allowing data retrieval.")
+    st.code(pending["sql"], language="sql")
+    with st.form(f"approval_{pending['approval_token']}"):
+        revised_sql = st.text_area("SQL to review", value=pending["sql"], max_chars=10000)
+        approve = st.form_submit_button("Approve and execute", type="primary")
+        reject = st.form_submit_button("Reject request")
+        revise = st.form_submit_button("Validate revised SQL")
+    if approve or reject or revise:
+        if approve and revised_sql != pending["sql"]:
+            st.warning("SQL was edited. Select Validate revised SQL and review it again before approval.")
+        else:
+            try:
+                action = "approve" if approve else "reject" if reject else "edit"
+                with st.spinner("Processing your decision…"):
+                    st.session_state["result"] = resume_request(
+                        active_id, action, pending["approval_token"], sql=revised_sql)
+                st.rerun()
+            except Exception:
+                logging.exception("Approval resume failed")
+                st.warning("The decision could not be completed. Reload to check the saved request state.")
+
+if "result" in st.session_state and st.session_state["result"].get("run_state") not in {"awaiting_approval", "failed_recoverable"}:
     result = st.session_state["result"]
-    st.subheader("Execution result")
+    st.subheader("Results")
     st.write(f"Status: **{result['status']}**")
-    if "cache_source" in result:
-        cached_result = result["cache_source"] == "result cache"
-        source = {"result cache": "Saved result", "agents / LLM cache": "Cached LLM responses",
-                  "live agents": "Live agents"}.get(result["cache_source"], result["cache_source"])
-        execution = "Database Hit" if not cached_result and result.get("execution_status") in {"Success", "Blocked", "Error"} else "Skipped"
-        st.info(f"**Source -** {source}  \n"
-                f"**Agents and Database execution -** {execution}  \n"
-                f"**Request duration -** {result['elapsed_seconds']:.3f} seconds")
-    if result.get("sql"):
-        st.code(result["sql"], language="sql")
+    if "elapsed_seconds" in result:
+        st.caption(f"Request completed in {result['elapsed_seconds']:.3f} seconds")
     if result["status"] == "completed":
         st.success(result["message"])
         st.dataframe(pd.DataFrame(result["rows"], columns=result["columns"]), use_container_width=True, hide_index=True)
     else:
         st.warning(result["message"])
 
+
 with st.expander("Enterprise Audit Logs"):
-    st.caption("Recent requests, newest first. Cached requests retain the original validation outcomes; checks are not rerun.")
+    st.caption("Recent requests, newest first. Human approval decisions are recorded with each request.")
     st.button("Refresh audit logs")
     try:
         entries = read_recent_audit_logs()
@@ -131,7 +159,7 @@ with st.expander("DBA Email Inbox (Local Test)"):
             st.info("No captured emails yet. Try: Show all employees.")
         for message in messages:
             st.markdown(f"**{message['subject']}**")
-            st.caption(f"From: {message['from']} · To: {message['to']}")
+            st.caption(f"From: {message['from']} Â· To: {message['to']}")
             for line in message["body"].splitlines():
                 if line.startswith(("Reason:", "Timestamp (UTC):")):
                     st.write(line)

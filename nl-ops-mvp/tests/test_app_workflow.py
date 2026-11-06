@@ -29,9 +29,6 @@ def test_ui_handles_noop_updates_without_false_failure_or_duplicate_audit(tmp_pa
     monkeypatch.setattr("plan_server.start_plan_server", lambda: Mock())
     notify = Mock(return_value={"status": "Sent"})
     monkeypatch.setattr(workflow, "send_dba_alert", notify)
-    run_cached = cache.run_cached
-    monkeypatch.setattr(cache, "run_cached", lambda request, limit, live, db:
-                        run_cached(request, limit, live, db, result_path=tmp_path / "cache.db"))
     sql = "SELECT * FROM employees" if blocked else "SELECT name, salary FROM employees WHERE id=1"
     responses = iter([
         AIMessage(content="", tool_calls=[{"name": "get_table_metadata", "args": {"table_name": "employees"}, "id": "meta"}]),
@@ -46,6 +43,11 @@ def test_ui_handles_noop_updates_without_false_failure_or_duplicate_audit(tmp_pa
     app.text_area[0].set_value("Inspect employees and show employee 1" if not blocked else "List all employees")
     next(button for button in app.button if button.label == "Submit request").click().run(timeout=20)
     assert not app.exception
+    if not blocked:
+        assert app.session_state["result"]["status"] == "awaiting_approval"
+        assert not audit_logger.read_recent_audit_logs()
+        next(button for button in app.button if button.label == "Approve and execute").click().run(timeout=20)
+        assert not app.exception
     result = app.session_state["result"]
     assert result["status"] == ("blocked" if blocked else "completed")
     assert result["audit_written"]
@@ -59,4 +61,63 @@ def test_ui_handles_noop_updates_without_false_failure_or_duplicate_audit(tmp_pa
     else:
         notify.assert_not_called()
         assert records[0]["execution_outcome"] == "Success"
-        assert result["rows"] == [("Alex Morgan", 82000.0)]
+        assert result["rows"] == [["Alex Morgan", 82000.0]]
+
+@pytest.mark.parametrize("source,cache_status,execution", [
+    ("result cache", "Hit (query results)", "Skipped"),
+    ("agents / LLM cache", "Hit (LLM responses)", "Executed"),
+    ("live agents", "Miss", "Executed"),
+])
+def test_results_hide_technical_details(monkeypatch, source, cache_status, execution):
+    monkeypatch.setattr(database, "initialize_database", lambda: None)
+    monkeypatch.setattr("plan_server.start_plan_server", lambda: Mock())
+    app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"))
+    app.session_state["result"] = {
+        "status": "completed", "message": "Returned 1 row(s).",
+        "cache_source": source, "execution_status": "Success", "elapsed_seconds": 0.01,
+        "columns": ["name"], "rows": [["Alex Morgan"]],
+    }
+    app.run(timeout=20)
+    assert not app.exception
+    assert all(expander.label != "Technical details" for expander in app.expander)
+    assert any("Request completed in" in caption.value for caption in app.caption)
+    assert len(app.dataframe) >= 1
+    assert not app.code
+    assert all("Cache status" not in info.value and "Database execution" not in info.value
+               for info in app.info)
+
+
+def test_ui_retries_saved_failure_then_requires_explicit_approval(tmp_path, monkeypatch):
+    path = tmp_path / "recovery_ui.db"
+    initialize = database.initialize_database
+    initialize(path)
+    monkeypatch.setattr(database, "initialize_database", lambda: initialize(path))
+    monkeypatch.setattr(workflow, "get_schema", lambda: database.get_schema(path))
+    monkeypatch.setattr(workflow, "read_only_connection", lambda: database.read_only_connection(path))
+    safety = Mock(return_value=SafetyDecision(allowed=True, reason="Safe"))
+    generation = Mock(side_effect=[TimeoutError("model timeout"), "SELECT name FROM employees WHERE id=1"])
+    execution = Mock(return_value={"rows": [["Alex Morgan"]], "columns": ["name"], "truncated": False})
+    monkeypatch.setattr(workflow, "check_intent", safety)
+    monkeypatch.setattr(workflow, "generate_sql", generation)
+    monkeypatch.setattr(workflow, "execute_query", execution)
+    monkeypatch.setattr(workflow, "graph", workflow.build_graph())
+    monkeypatch.setattr("plan_server.start_plan_server", lambda: Mock())
+    app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py")).run(timeout=20)
+    app.text_area[0].set_value("Find employee 1")
+    next(b for b in app.button if b.label == "Submit request").click().run(timeout=20)
+    assert not app.exception
+    assert app.session_state["result"]["run_state"] == "failed_recoverable"
+    tid = app.session_state["active_request_id"]
+    app.run(timeout=20)
+    assert generation.call_count == 1  # Browser rerun must never retry on its own.
+    next(b for b in app.button if b.label == "Retry saved request").click().run(timeout=20)
+    assert not app.exception
+    assert app.session_state["active_request_id"] == tid
+    assert app.session_state["result"]["run_state"] == "awaiting_approval"
+    execution.assert_not_called()
+    safety.assert_called_once()
+    next(b for b in app.button if b.label == "Approve and execute").click().run(timeout=20)
+    assert not app.exception
+    assert app.session_state["result"]["run_state"] == "finished"
+    execution.assert_called_once()
+    assert len(audit_logger.read_recent_audit_logs()) == 1

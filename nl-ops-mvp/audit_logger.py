@@ -26,6 +26,8 @@ def append_audit_event(state: dict, *, cached: bool = False, path=None) -> dict:
     plan = state.get("plan_status", "NotRun")
     if cached:
         outcome = "Cached"
+    elif status == "rejected":
+        outcome = "Rejected-by-Human"
     elif status == "completed":
         outcome = "Success"
     elif safety == "Blocked":
@@ -42,6 +44,11 @@ def append_audit_event(state: dict, *, cached: bool = False, path=None) -> dict:
         "user_query": state.get("raw_request", state.get("request", "")),
         "safety_status": safety,
         "sql_generated": state.get("sql", ""),
+        "approval_status": state.get("approval_status", "NotRequested"),
+        "review_history": state.get("review_history", []),
+        "error_kind": state.get("error_kind", ""),
+        "error_history": state.get("error_history", []),
+        "recovery_attempts": state.get("recovery_attempts", 0),
         "guardrail_status": {"ast": ast, "explain": plan},
         "execution_outcome": outcome,
         "row_count": len(state.get("rows", [])) if status == "completed" else 0,
@@ -50,11 +57,38 @@ def append_audit_event(state: dict, *, cached: bool = False, path=None) -> dict:
         "plan_links": state.get("plan_links") or save_plan_artifacts(state.get("sql", ""), state.get("execution_plan", "")),
         "dba_alert": state.get("dba_alert", {"status": "NotNeeded"}),
     }
-    encoded = json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n"
-    with _lock, Path(path or AUDIT_PATH).open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write(encoded)
-        handle.flush()
-        os.fsync(handle.fileno())
+    try:
+        encoded = json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n"
+    except (TypeError, ValueError) as exc:
+        from workflow_errors import OperationError
+        raise OperationError("Audit record contains invalid or non-serializable data.",
+                             kind="infrastructure", retryable=False) from exc
+    # The request ID is the idempotency key for terminal audit writes. A crash
+    # after fsync but before graph checkpointing must not append a second record.
+    target = Path(path or AUDIT_PATH)
+    with _lock:
+        if target.exists():
+            with target.open(encoding="utf-8") as existing:
+                for line in existing:
+                    try:
+                        previous = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(previous, dict) and previous.get("request_id") == record["request_id"]:
+                        return previous
+        # A process may have stopped during the last write. Separate a torn
+        # trailing line so the replayed, complete record remains readable.
+        needs_separator = False
+        if target.exists() and target.stat().st_size:
+            with target.open("rb") as existing:
+                existing.seek(-1, 2)
+                needs_separator = existing.read(1) != b"\n"
+        with target.open("a", encoding="utf-8", newline="\n") as handle:
+            if needs_separator:
+                handle.write("\n")
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
     return record
 
 
